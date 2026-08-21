@@ -1,8 +1,3 @@
-/**
- * Real ClusterLinkHub contract types, event whitelist, and plugin
- * configuration. Pure module: no Node-only or cordis imports, so the client
- * half can type-import from here without dragging host code.
- */
 /** A2A message type the coordinator uses to dispatch a task to a node. */
 export declare const TASK_REQUEST_TYPE: "task.request";
 /** Task-event kinds the node reports via `reportTaskEvent` (caller convention). */
@@ -76,6 +71,25 @@ export interface RelayEvent {
 export declare const EVENT_WHITELIST: Set<string>;
 export declare const DEFAULT_HUB_URL = "http://localhost:5080/cluster-link/hub";
 export declare const DEFAULT_DSH_VERSION = "0.1.0-rc.8";
+/**
+ * Fallback config file location when the process env carries no SUNSET_*
+ * values (e.g. an externally managed production instance whose env cannot be
+ * changed): `$DSH_HOME/dsh-node-agent.json`, or the path in SUNSET_CONFIG_FILE.
+ */
+export declare const DEFAULT_CONFIG_FILE = "/data/dsh-home/dsh-node-agent.json";
+/** JSON shape of the fallback config file (same fields as the env vars). */
+export interface PluginConfigFile {
+    hubUrl?: string;
+    nodeToken?: string;
+    nodeId?: string;
+    maxConcurrency?: number;
+    heartbeatIntervalMs?: number;
+    eventBatchMs?: number;
+    eventBufferSize?: number;
+    logBufferSize?: number;
+    workspace?: string;
+    dshVersion?: string;
+}
 /** Resolved plugin configuration (SUNSET_* env vars, see requirements-v3 §4). */
 export interface PluginConfig {
     hubUrl: string;
@@ -92,6 +106,8 @@ export interface PluginConfig {
     dshVersion: string;
 }
 export declare function loadConfig(env?: NodeJS.ProcessEnv): PluginConfig;
+/** Read and validate the fallback config file; missing/malformed → defaults. */
+export declare function readConfigFile(path: string): PluginConfigFile;
 export interface ClusterStatusView {
     state: string;
     connected: boolean;

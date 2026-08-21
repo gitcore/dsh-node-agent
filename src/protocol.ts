@@ -3,6 +3,7 @@
  * configuration. Pure module: no Node-only or cordis imports, so the client
  * half can type-import from here without dragging host code.
  */
+import { readFileSync } from "node:fs";
 
 /** A2A message type the coordinator uses to dispatch a task to a node. */
 export const TASK_REQUEST_TYPE = "task.request" as const;
@@ -100,6 +101,27 @@ export const EVENT_WHITELIST = new Set([
 export const DEFAULT_HUB_URL = "http://localhost:5080/cluster-link/hub";
 export const DEFAULT_DSH_VERSION = "0.1.0-rc.8";
 
+/**
+ * Fallback config file location when the process env carries no SUNSET_*
+ * values (e.g. an externally managed production instance whose env cannot be
+ * changed): `$DSH_HOME/dsh-node-agent.json`, or the path in SUNSET_CONFIG_FILE.
+ */
+export const DEFAULT_CONFIG_FILE = "/data/dsh-home/dsh-node-agent.json";
+
+/** JSON shape of the fallback config file (same fields as the env vars). */
+export interface PluginConfigFile {
+  hubUrl?: string;
+  nodeToken?: string;
+  nodeId?: string;
+  maxConcurrency?: number;
+  heartbeatIntervalMs?: number;
+  eventBatchMs?: number;
+  eventBufferSize?: number;
+  logBufferSize?: number;
+  workspace?: string;
+  dshVersion?: string;
+}
+
 /** Resolved plugin configuration (SUNSET_* env vars, see requirements-v3 §4). */
 export interface PluginConfig {
   hubUrl: string;
@@ -123,7 +145,7 @@ function positiveInt(value: string | undefined, fallback: number): number {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): PluginConfig {
-  return {
+  const fromEnv = {
     hubUrl: env.SUNSET_HUB_URL ?? DEFAULT_HUB_URL,
     nodeToken: env.SUNSET_NODE_TOKEN ?? "",
     nodeId: env.SUNSET_NODE_ID ?? "",
@@ -135,6 +157,50 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PluginConfig {
     workspace: env.SUNSET_WORKSPACE ?? process.cwd(),
     dshVersion: env.SUNSET_DSH_VERSION ?? DEFAULT_DSH_VERSION,
   };
+  // When the process env lacks the required node identity (externally managed
+  // production instance), fall back to the config file so the plugin still
+  // loads without touching the host's environment.
+  if (fromEnv.nodeToken && fromEnv.nodeId) return fromEnv;
+  const file = readConfigFile(env.SUNSET_CONFIG_FILE ?? DEFAULT_CONFIG_FILE);
+  return {
+    ...fromEnv,
+    hubUrl: file.hubUrl ?? fromEnv.hubUrl,
+    nodeToken: file.nodeToken ?? fromEnv.nodeToken,
+    nodeId: file.nodeId ?? fromEnv.nodeId,
+    maxConcurrency: file.maxConcurrency ?? fromEnv.maxConcurrency,
+    heartbeatIntervalMs: file.heartbeatIntervalMs ?? fromEnv.heartbeatIntervalMs,
+    eventBatchMs: file.eventBatchMs ?? fromEnv.eventBatchMs,
+    eventBufferSize: file.eventBufferSize ?? fromEnv.eventBufferSize,
+    logBufferSize: file.logBufferSize ?? fromEnv.logBufferSize,
+    workspace: file.workspace ?? fromEnv.workspace,
+    dshVersion: file.dshVersion ?? fromEnv.dshVersion,
+  };
+}
+
+/** Read and validate the fallback config file; missing/malformed → defaults. */
+export function readConfigFile(path: string): PluginConfigFile {
+  try {
+    const raw = readFileSync(path, "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const record = parsed as Record<string, unknown>;
+    const pickString = (key: string): string | undefined => (typeof record[key] === "string" && record[key] !== "" ? (record[key] as string) : undefined);
+    const pickInt = (key: string): number | undefined => (typeof record[key] === "number" && Number.isFinite(record[key] as number) && (record[key] as number) > 0 ? (record[key] as number) : undefined);
+    return {
+      hubUrl: pickString("hubUrl"),
+      nodeToken: pickString("nodeToken"),
+      nodeId: pickString("nodeId"),
+      maxConcurrency: pickInt("maxConcurrency"),
+      heartbeatIntervalMs: pickInt("heartbeatIntervalMs"),
+      eventBatchMs: pickInt("eventBatchMs"),
+      eventBufferSize: pickInt("eventBufferSize"),
+      logBufferSize: pickInt("logBufferSize"),
+      workspace: pickString("workspace"),
+      dshVersion: pickString("dshVersion"),
+    };
+  } catch {
+    return {};
+  }
 }
 
 /* ------------------------------------------------------------------ */
