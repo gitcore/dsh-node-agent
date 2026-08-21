@@ -1,0 +1,15 @@
+# dsh-node-agent — patch overlay for `dsh web`.
+#
+# `insert:` (not a plain entry) because this patch ADDS a new loader entry;
+# a plain `- id:` row is an override that targets an EXISTING id and would be
+# skipped with "entry not found".
+#
+# The entry name is the bare package name `dsh-node-agent` (the client
+# bundle registers under this id, and the client-modules graph row id must
+# match). The plugin must therefore be resolvable by that name from both:
+#   - the Host loader (imported from the dsh package tree), and
+#   - the profile dir (client-modules createRequire(baseUrl)),
+# e.g. by symlinking/copying it into both node_modules paths (see README §部署).
+- insert:
+    - id: node-agent
+      name: dsh-node-agent
