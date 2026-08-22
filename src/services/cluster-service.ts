@@ -5,7 +5,7 @@
  */
 import type { Context } from "@deepseek-ai/cordis";
 import { Remote, TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
-import type { ActiveTaskView, ClusterStatusView, MetricsView, PluginConfig } from "../protocol.js";
+import type { ActiveTaskView, ClusterStatusView, MetricsView, PluginConfig, RecentTaskView } from "../protocol.js";
 import type { HubConnectionManager } from "../connection/hub-connection.js";
 import type { TaskRegistry } from "../task/task-registry.js";
 import type { IntakeCounters } from "../task/task-intake.js";
@@ -63,6 +63,19 @@ export class ClusterService extends TypertRemoteService {
       startedAt: record.startedAt,
       elapsedMs: now - record.startedAt,
       lastEventType: record.lastEventType,
+    }));
+  }
+
+  @Remote
+  getRecentTasks(): RecentTaskView[] {
+    return this.deps.registry.recent().map((entry) => ({
+      taskId: entry.taskId,
+      source: entry.source,
+      finishReason: entry.finishReason,
+      startedAt: entry.startedAt,
+      finishedAt: entry.finishedAt,
+      durationMs: entry.durationMs,
+      lastEventType: entry.lastEventType,
     }));
   }
 

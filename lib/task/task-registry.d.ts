@@ -18,9 +18,23 @@ export interface TaskRecord {
     /** Last assigned per-task forward seq. */
     seq: number;
 }
+/** Bounded terminal history entry — survives registry deletion so the panel
+ * can show recently finished tasks without catching them mid-run. */
+export interface TaskHistoryEntry {
+    taskId: string;
+    source: TaskSource;
+    finishReason: FinishReason;
+    startedAt: number;
+    finishedAt: number;
+    durationMs: number;
+    lastEventType?: string;
+}
 export declare class TaskRegistry {
+    private readonly historyCapacity;
     private tasks;
     private handles;
+    private readonly history;
+    constructor(historyCapacity?: number);
     begin(taskId: string, source: TaskSource): TaskRecord;
     get(taskId: string): TaskRecord | undefined;
     has(taskId: string): boolean;
@@ -35,6 +49,10 @@ export declare class TaskRegistry {
     list(): TaskRecord[];
     listActive(): TaskRecord[];
     delete(taskId: string): void;
+    /** Recent finished tasks, newest first (bounded). */
+    recent(): TaskHistoryEntry[];
+    /** Record a terminal outcome into the bounded history. */
+    archive(taskId: string, finishReason: FinishReason, source: TaskSource): void;
     /** Stop and dispose every live handle (plugin unload). */
     disposeAll(): Promise<void>;
 }

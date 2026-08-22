@@ -106,6 +106,7 @@ export class TaskIntake {
       void this.run(taskId, handle, prompt);
     } catch (error) {
       this.registry.finish(taskId, "error");
+      this.registry.archive(taskId, "error", source);
       this.registry.delete(taskId);
       this.counters.failedTasks++;
       const detail = errorMessage(error).slice(0, 300);
@@ -125,8 +126,10 @@ export class TaskIntake {
 
       const outcome = summarizeOutcome(agent.session.events, firstSeq);
       this.relay.detach(taskId);
+      const source = this.registry.get(taskId)?.source ?? "taskDispatched";
       if (outcome.finishReason === "completed") {
         this.registry.finish(taskId, "completed");
+        this.registry.archive(taskId, "completed", source);
         this.counters.processedTasks++;
         this.log.info("intake", `task ${taskId} completed`, taskId);
         await this.hub.reportTaskEvent({
@@ -137,6 +140,7 @@ export class TaskIntake {
         });
       } else {
         this.registry.finish(taskId, outcome.finishReason);
+        this.registry.archive(taskId, outcome.finishReason, source);
         this.counters.failedTasks++;
         this.log.warn("intake", `task ${taskId} finished with reason=${outcome.finishReason}`, taskId);
         await this.hub.reportTaskEvent({
@@ -148,6 +152,7 @@ export class TaskIntake {
     } catch (error) {
       this.relay.detach(taskId);
       this.registry.finish(taskId, "error");
+      this.registry.archive(taskId, "error", this.registry.get(taskId)?.source ?? "taskDispatched");
       this.counters.failedTasks++;
       const detail = errorMessage(error).slice(0, 300);
       this.log.error("intake", `task ${taskId} crashed: ${detail}`, taskId);

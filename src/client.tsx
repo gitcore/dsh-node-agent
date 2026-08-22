@@ -10,7 +10,7 @@ import type { InvocationDescriptor } from "@deepseek-ai/dsh-typert-protocol";
 // Sidebar slot declarations (sidebar.footer.action) — a real type import forces
 // the ambient SlotMap augmentation into the program.
 import type { SidebarFooterActionOwnerProps } from "@deepseek-ai/dsh-client-ui-sidebar/client";
-import type { ActiveTaskView, ClusterStatusView, MetricsView } from "./protocol.js";
+import type { ActiveTaskView, ClusterStatusView, MetricsView, RecentTaskView } from "./protocol.js";
 import type { LogEntry } from "./services/log-buffer.js";
 import { ClusterPanel, type ClusterPanelFace } from "./cluster-view.js";
 
@@ -19,6 +19,7 @@ declare module "@deepseek-ai/dsh-typert-protocol" {
     clusterService: {
       getStatus(): Promise<RemoteResult<ClusterStatusView>>;
       getActiveTasks(): Promise<RemoteResult<ActiveTaskView[]>>;
+      getRecentTasks(): Promise<RemoteResult<RecentTaskView[]>>;
       getLogs(level?: string): Promise<RemoteResult<LogEntry[]>>;
       getMetrics(): Promise<RemoteResult<MetricsView>>;
     };
@@ -94,6 +95,7 @@ const direct = (method: string, parameters: InvocationDescriptor["parameters"] =
 const descriptors: InvocationDescriptor[] = [
   direct("getStatus"),
   direct("getActiveTasks"),
+  direct("getRecentTasks"),
   direct("getLogs", [param("level")]),
   direct("getMetrics"),
 ];
@@ -141,6 +143,7 @@ export function apply(ctx: ClientContext): void {
       return {
         getStatus: async () => { throw notReady; },
         getActiveTasks: async () => { throw notReady; },
+        getRecentTasks: async () => { throw notReady; },
         getLogs: async (level?: string) => { throw notReady; },
         getMetrics: async () => { throw notReady; },
       } as ClientContext["remote"]["clusterService"];
@@ -154,6 +157,7 @@ export function apply(ctx: ClientContext): void {
     // function, and the slot system removes the crashed entry).
     getStatus: () => unwrap(cluster().getStatus()),
     getActiveTasks: () => unwrap(cluster().getActiveTasks()),
+    getRecentTasks: () => unwrap(cluster().getRecentTasks()),
     getLogs: (level?: string) => unwrap(cluster().getLogs(level)),
     getMetrics: () => unwrap(cluster().getMetrics()),
   });

@@ -132,6 +132,15 @@ export interface ActiveTaskView {
     elapsedMs: number;
     lastEventType?: string;
 }
+export interface RecentTaskView {
+    taskId: string;
+    source: string;
+    finishReason: string;
+    startedAt: number;
+    finishedAt: number;
+    durationMs: number;
+    lastEventType?: string;
+}
 export interface MetricsView {
     connectedForMs: number;
     processedTasks: number;

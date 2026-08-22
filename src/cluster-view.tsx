@@ -8,12 +8,13 @@ import type { InjectFace, PropsRuntime } from "@deepseek-ai/dsh-client-ui-slots"
 // Sidebar slot declarations (sidebar.footer.action) — a real type import forces
 // the ambient SlotMap augmentation into the program.
 import type { SidebarFooterActionOwnerProps } from "@deepseek-ai/dsh-client-ui-sidebar/client";
-import type { ActiveTaskView, ClusterStatusView, MetricsView } from "./protocol.js";
+import type { ActiveTaskView, ClusterStatusView, MetricsView, RecentTaskView } from "./protocol.js";
 import type { LogEntry } from "./services/log-buffer.js";
 
 export interface ClusterPanelFace {
   getStatus(): Promise<ClusterStatusView>;
   getActiveTasks(): Promise<ActiveTaskView[]>;
+  getRecentTasks(): Promise<RecentTaskView[]>;
   getLogs(level?: string): Promise<LogEntry[]>;
   getMetrics(): Promise<MetricsView>;
 }
@@ -60,7 +61,7 @@ const triggerStyle: React.CSSProperties = {
   width: "100%",
 };
 
-export function ClusterPanel({ wide, getStatus, getActiveTasks, getLogs, getMetrics }: ClusterPanelProps): React.JSX.Element | null {
+export function ClusterPanel({ wide, getStatus, getActiveTasks, getRecentTasks, getLogs, getMetrics }: ClusterPanelProps): React.JSX.Element | null {
   const [open, setOpen] = useState(false);
   return (
     <>
@@ -76,7 +77,7 @@ export function ClusterPanel({ wide, getStatus, getActiveTasks, getLogs, getMetr
         <span style={{ fontSize: 14, lineHeight: 1 }}>◎</span>
         {wide && <span>集群</span>}
       </button>
-      {open && <ClusterDialog getStatus={getStatus} getActiveTasks={getActiveTasks} getLogs={getLogs} getMetrics={getMetrics} onClose={() => setOpen(false)} />}
+      {open && <ClusterDialog getStatus={getStatus} getActiveTasks={getActiveTasks} getRecentTasks={getRecentTasks} getLogs={getLogs} getMetrics={getMetrics} onClose={() => setOpen(false)} />}
     </>
   );
 }
@@ -85,9 +86,10 @@ interface ClusterDialogProps extends ClusterPanelFace {
   onClose(): void;
 }
 
-function ClusterDialog({ getStatus, getActiveTasks, getLogs, getMetrics, onClose }: ClusterDialogProps): React.JSX.Element | null {
+function ClusterDialog({ getStatus, getActiveTasks, getRecentTasks, getLogs, getMetrics, onClose }: ClusterDialogProps): React.JSX.Element | null {
   const [status, setStatus] = useState<ClusterStatusView | null>(null);
   const [tasks, setTasks] = useState<ActiveTaskView[]>([]);
+  const [recent, setRecent] = useState<RecentTaskView[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [metrics, setMetrics] = useState<MetricsView | null>(null);
   const [level, setLevel] = useState<string>("all");
@@ -98,10 +100,11 @@ function ClusterDialog({ getStatus, getActiveTasks, getLogs, getMetrics, onClose
     const tick = async () => {
       try {
         const filter = level === "all" ? undefined : level;
-        const [s, t, l, m] = await Promise.all([getStatus(), getActiveTasks(), getLogs(filter), getMetrics()]);
+        const [s, t, r, l, m] = await Promise.all([getStatus(), getActiveTasks(), getRecentTasks(), getLogs(filter), getMetrics()]);
         if (!alive) return;
         setStatus(s);
         setTasks(t);
+        setRecent(r);
         setLogs(l);
         setMetrics(m);
         setError(null);
@@ -115,7 +118,7 @@ function ClusterDialog({ getStatus, getActiveTasks, getLogs, getMetrics, onClose
       alive = false;
       clearInterval(timer);
     };
-  }, [getStatus, getActiveTasks, getLogs, getMetrics, level]);
+  }, [getStatus, getActiveTasks, getRecentTasks, getLogs, getMetrics, level]);
 
   const levelColor = (lv: string) => (lv === "error" ? C.err : lv === "warn" ? C.warn : C.dim);
   const stateColor = status ? (status.connected ? C.ok : status.registered ? C.accent : status.state === "reconnecting" ? C.warn : C.err) : C.dim;
@@ -176,6 +179,19 @@ function ClusterDialog({ getStatus, getActiveTasks, getLogs, getMetrics, onClose
               <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }} title={t.taskId}>{t.taskId}</span>
               <span style={{ color: C.accent, flexShrink: 0 }}>{t.lastEventType ?? t.status}</span>
               <span style={{ color: C.dim, flexShrink: 0 }}>{fmtElapsed(t.elapsedMs)}</span>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ background: C.bg, borderRadius: 8, padding: 10, border: `1px solid ${C.border}` }}>
+          <div style={{ color: C.dim, marginBottom: 6 }}>最近任务</div>
+          {recent.length === 0 && <div style={{ color: C.dim }}>无</div>}
+          {recent.slice(0, 10).map((t) => (
+            <div key={t.taskId} style={{ display: "flex", justifyContent: "space-between", gap: 8, padding: "4px 0", borderBottom: `1px solid ${C.border}` }}>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }} title={t.taskId}>{t.taskId}</span>
+              <span style={{ color: t.finishReason === "completed" ? C.ok : C.err, flexShrink: 0 }}>{t.finishReason}</span>
+              <span style={{ color: C.dim, flexShrink: 0 }}>{fmtElapsed(t.durationMs)}</span>
+              <span style={{ color: C.dim, flexShrink: 0 }}>{fmtClock(t.finishedAt)}</span>
             </div>
           ))}
         </div>

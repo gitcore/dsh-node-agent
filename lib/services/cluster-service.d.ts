@@ -5,7 +5,7 @@
  */
 import type { Context } from "@deepseek-ai/cordis";
 import { TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
-import type { ActiveTaskView, ClusterStatusView, MetricsView, PluginConfig } from "../protocol.js";
+import type { ActiveTaskView, ClusterStatusView, MetricsView, PluginConfig, RecentTaskView } from "../protocol.js";
 import type { HubConnectionManager } from "../connection/hub-connection.js";
 import type { TaskRegistry } from "../task/task-registry.js";
 import type { IntakeCounters } from "../task/task-intake.js";
@@ -24,6 +24,7 @@ export declare class ClusterService extends TypertRemoteService {
     constructor(ctx: Context, deps: ClusterServiceDeps);
     getStatus(): ClusterStatusView;
     getActiveTasks(): ActiveTaskView[];
+    getRecentTasks(): RecentTaskView[];
     getLogs(level?: string): LogEntry[];
     getMetrics(): MetricsView;
 }

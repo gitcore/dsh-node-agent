@@ -21,9 +21,24 @@ export interface TaskRecord {
   seq: number;
 }
 
+/** Bounded terminal history entry — survives registry deletion so the panel
+ * can show recently finished tasks without catching them mid-run. */
+export interface TaskHistoryEntry {
+  taskId: string;
+  source: TaskSource;
+  finishReason: FinishReason;
+  startedAt: number;
+  finishedAt: number;
+  durationMs: number;
+  lastEventType?: string;
+}
+
 export class TaskRegistry {
   private tasks = new Map<string, TaskRecord>();
   private handles = new Map<string, AgentHandle>();
+  private readonly history: TaskHistoryEntry[] = [];
+
+  constructor(private readonly historyCapacity = 20) {}
 
   begin(taskId: string, source: TaskSource): TaskRecord {
     const record: TaskRecord = { taskId, status: "starting", source, startedAt: Date.now(), seq: 0 };
@@ -95,6 +110,26 @@ export class TaskRegistry {
   delete(taskId: string): void {
     this.tasks.delete(taskId);
     this.handles.delete(taskId);
+  }
+
+  /** Recent finished tasks, newest first (bounded). */
+  recent(): TaskHistoryEntry[] {
+    return [...this.history];
+  }
+
+  /** Record a terminal outcome into the bounded history. */
+  archive(taskId: string, finishReason: FinishReason, source: TaskSource): void {
+    const record = this.tasks.get(taskId);
+    this.history.unshift({
+      taskId,
+      source,
+      finishReason,
+      startedAt: record?.startedAt ?? Date.now(),
+      finishedAt: record?.finishedAt ?? Date.now(),
+      durationMs: record?.finishedAt ? record.finishedAt - record.startedAt : 0,
+      lastEventType: record?.lastEventType,
+    });
+    if (this.history.length > this.historyCapacity) this.history.length = this.historyCapacity;
   }
 
   /** Stop and dispose every live handle (plugin unload). */
