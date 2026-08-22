@@ -9,6 +9,8 @@
  * workspace's candidate account. This module resolves the hint to a target
  * (cwd path + attach callback) and the intake applies both.
  */
+import { mkdir } from "node:fs/promises";
+import { basename } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 import type { Logger } from "../services/log-buffer.js";
 
@@ -51,10 +53,14 @@ export async function resolveWorkspace(ctx: Context, hint: unknown, log: Logger)
       }
     }
     if (!workspace) {
-      // The dispatcher named a directory the node doesn't own yet — register it
-      // (durable, reusable; create() reuses an existing record for the path).
+      // The dispatcher named a directory the node doesn't own yet — create it
+      // on disk (mkdir -p) and register it (durable, reusable; create() reuses
+      // an existing record for the path). Without a real directory the session
+      // cwd cannot be validated and attach always fails.
       try {
-        workspace = await registry.create(value);
+        await mkdir(value, { recursive: true });
+        // Title as the directory name (e.g. "test"), not the full path.
+        workspace = await registry.create(value, basename(value));
         log.info("intake", `created workspace for ${value}`);
       } catch (error) {
         log.warn("intake", `workspace hint ${JSON.stringify(value)} is neither id/title nor a usable path: ${error instanceof Error ? error.message : String(error)}`);
@@ -62,6 +68,9 @@ export async function resolveWorkspace(ctx: Context, hint: unknown, log: Logger)
       }
     }
     const target = workspace;
+    // Membership requires the session cwd to resolve on disk; make sure the
+    // registered path is a real directory before handing it out.
+    await mkdir(target.path, { recursive: true });
     return {
       path: target.path,
       attach: (sessionId: string) => target.attachSession(sessionId),

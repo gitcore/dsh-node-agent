@@ -78,7 +78,7 @@ Docker 一键方案见仓库根 `Dockerfile`。
   ```
 - **taskDispatched**：`metadata.workspace` 字段（同上）
 
-`workspace` 可以是：工作区 **id**、**标题**，或**目录路径**（未注册的路径会自动注册为工作区；不存在的路径回退到 `SUNSET_WORKSPACE`）。
+`workspace` 可以是：工作区 **id**、**标题**，或**目录路径**（已有工作区直接复用；未注册的路径会先 `mkdir -p` 再自动注册为工作区，保证会话 cwd 可解析、attach 校验通过）。
 
 ## 卸载清理
 
