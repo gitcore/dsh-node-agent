@@ -67,6 +67,19 @@ npm run build                    # tsc 编译 Host + esbuild 构建 client bundl
 
 Docker 一键方案见仓库根 `Dockerfile`。
 
+## 指定工作区（A2A / taskDispatched）
+
+任务可以指定会话归属的工作区（否则出现在侧栏"未分组"）。会话 cwd 用工作区路径并 attach 到工作区账目，侧栏即按工作区分组显示。
+
+- **A2A `task.request`**：`payload.workspace` 字段：
+  ```json
+  { "type": "task.request", "correlationId": "task-01",
+    "payload": { "prompt": "...", "workspace": "/path/to/dir" } }
+  ```
+- **taskDispatched**：`metadata.workspace` 字段（同上）
+
+`workspace` 可以是：工作区 **id**、**标题**，或**目录路径**（未注册的路径会自动注册为工作区；不存在的路径回退到 `SUNSET_WORKSPACE`）。
+
 ## 卸载清理
 
 插件卸载（fiber dispose）时：停止 SignalR 连接、取消并 dispose 所有进行中的 agent、清空事件/日志缓冲。

@@ -13,6 +13,7 @@ import type { TaskRegistry, TaskSource } from "./task-registry.js";
 import type { EventRelay } from "../events/event-relay.js";
 import type { Logger } from "../services/log-buffer.js";
 import { summarizeOutcome } from "./task-completion.js";
+import { resolveWorkspace } from "./workspace.js";
 
 export interface IntakeCounters {
   processedTasks: number;
@@ -50,7 +51,8 @@ export class TaskIntake {
       this.log.warn("intake", `invalid taskDispatched payload: ${JSON.stringify({ taskId, hasPrompt: typeof prompt === "string" })}`);
       return;
     }
-    void this.accept(taskId, prompt, payload.metadata, "taskDispatched");
+    const workspaceHint = payload?.metadata && typeof payload.metadata === "object" ? (payload.metadata as Record<string, unknown>).workspace : undefined;
+    void this.accept(taskId, prompt, payload.metadata, "taskDispatched", workspaceHint);
   }
 
   onA2AMessage(message: ClusterA2AMessageEnvelope): void {
@@ -66,11 +68,12 @@ export class TaskIntake {
       this.log.warn("intake", `a2a task.request without prompt (taskId=${taskId})`, taskId);
       return;
     }
+    const workspaceHint = payload.workspace;
     const metadata: Record<string, unknown> = { ...payload, messageId: message.messageId, fromNodeId: message.fromNodeId };
-    void this.accept(taskId, prompt, metadata, "a2a");
+    void this.accept(taskId, prompt, metadata, "a2a", workspaceHint);
   }
 
-  private async accept(taskId: string, prompt: string, metadata: Record<string, unknown> | null | undefined, source: TaskSource): Promise<void> {
+  private async accept(taskId: string, prompt: string, metadata: Record<string, unknown> | null | undefined, source: TaskSource, workspaceHint?: unknown): Promise<void> {
     if (this.registry.has(taskId)) {
       this.log.warn("intake", `duplicate taskId ${taskId}; rejecting`, taskId);
       await this.hub.reportTaskEvent({ taskId, kind: TASK_EVENT_KINDS.FAILED, message: "duplicate taskId" });
@@ -84,23 +87,37 @@ export class TaskIntake {
 
     this.registry.begin(taskId, source);
     this.log.info("intake", `accepting task ${taskId} (source=${source})`, taskId);
+    // Resolve the target workspace before creating the session (its path
+    // becomes the session cwd, which is half of workspace membership).
+    const workspace = await resolveWorkspace(this.ctx, workspaceHint, this.log);
+    const cwd = workspace?.path ?? this.config.workspace;
+    if (workspace) this.log.info("intake", `task ${taskId} -> workspace ${workspace.path}`, taskId);
     try {
       const handle = await this.ctx.agents.create({
         sessionId: SessionId(taskId),
-        meta: { cwd: this.config.workspace },
+        meta: { cwd },
         agentOptions: this.selection ? { provider: this.selection.provider, model: this.selection.model } : undefined,
         setup: (agentCtx) => {
           if (this.selection) installModelSelection(agentCtx, { current: this.selection, assembled: void 0 });
         },
       });
       this.registry.attachHandle(taskId, handle);
+      // Attach the session to the workspace account (the other half of
+      // membership) so the sidebar groups it under that workspace.
+      if (workspace) {
+        try {
+          await workspace.attach(taskId);
+        } catch (error) {
+          this.log.warn("intake", `workspace attach failed for ${taskId}: ${errorMessage(error)}`, taskId);
+        }
+      }
       this.registry.setRunning(taskId);
       this.relay.attach(taskId);
       const accepted = await this.hub.reportTaskEvent({
         taskId,
         kind: TASK_EVENT_KINDS.STARTED,
         message: "node accepted the task",
-        data: { sessionId: taskId, source },
+        data: { sessionId: taskId, source, ...(workspace ? { workspace: workspace.path } : {}) },
       });
       if (!accepted) this.log.warn("intake", `started event not delivered (hub offline); session ${taskId} is running`, taskId);
       void this.run(taskId, handle, prompt);
