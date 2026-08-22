@@ -76,6 +76,7 @@ export class ClusterService extends TypertRemoteService {
       finishedAt: entry.finishedAt,
       durationMs: entry.durationMs,
       lastEventType: entry.lastEventType,
+      ...(entry.finalResponse ? { finalResponse: entry.finalResponse } : {}),
     }));
   }
 

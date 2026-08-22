@@ -86,6 +86,35 @@ interface ClusterDialogProps extends ClusterPanelFace {
   onClose(): void;
 }
 
+/** One recent-task row: summary line; click to expand the final response. */
+function TaskHistoryRow({ task }: { task: RecentTaskView }): React.JSX.Element {
+  const [expanded, setExpanded] = useState(false);
+  const response = task.finalResponse ?? "";
+  return (
+    <div style={{ borderBottom: `1px solid ${C.border}`, padding: "4px 0" }}>
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => setExpanded((v) => !v)}
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setExpanded((v) => !v); } }}
+        style={{ display: "flex", justifyContent: "space-between", gap: 8, cursor: "pointer", alignItems: "baseline" }}
+      >
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }} title={task.taskId}>
+          {task.taskId.slice(0, 16)}
+        </span>
+        <span style={{ color: task.finishReason === "completed" ? C.ok : C.err, flexShrink: 0 }}>{task.finishReason}</span>
+        <span style={{ color: C.dim, flexShrink: 0 }}>{fmtElapsed(task.durationMs)}</span>
+        <span style={{ color: C.dim, flexShrink: 0 }}>{fmtClock(task.finishedAt)}</span>
+      </div>
+      {expanded && (
+        <div style={{ marginTop: 4, color: C.text, fontSize: 12, lineHeight: 1.5, whiteSpace: "pre-wrap", wordBreak: "break-all", background: C.panel, borderRadius: 6, padding: 8 }}>
+          {response.length > 0 ? response : "（无最终回复文本）"}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ClusterDialog({ getStatus, getActiveTasks, getRecentTasks, getLogs, getMetrics, onClose }: ClusterDialogProps): React.JSX.Element | null {
   const [status, setStatus] = useState<ClusterStatusView | null>(null);
   const [tasks, setTasks] = useState<ActiveTaskView[]>([]);
@@ -187,12 +216,7 @@ function ClusterDialog({ getStatus, getActiveTasks, getRecentTasks, getLogs, get
           <div style={{ color: C.dim, marginBottom: 6 }}>最近任务</div>
           {recent.length === 0 && <div style={{ color: C.dim }}>无</div>}
           {recent.slice(0, 10).map((t) => (
-            <div key={t.taskId} style={{ display: "flex", justifyContent: "space-between", gap: 8, padding: "4px 0", borderBottom: `1px solid ${C.border}` }}>
-              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }} title={t.taskId}>{t.taskId}</span>
-              <span style={{ color: t.finishReason === "completed" ? C.ok : C.err, flexShrink: 0 }}>{t.finishReason}</span>
-              <span style={{ color: C.dim, flexShrink: 0 }}>{fmtElapsed(t.durationMs)}</span>
-              <span style={{ color: C.dim, flexShrink: 0 }}>{fmtClock(t.finishedAt)}</span>
-            </div>
+            <TaskHistoryRow key={t.taskId} task={t} />
           ))}
         </div>
 

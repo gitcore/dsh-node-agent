@@ -31,6 +31,8 @@ export interface TaskHistoryEntry {
   finishedAt: number;
   durationMs: number;
   lastEventType?: string;
+  /** Final assistant response text (from the turn/end outcome). */
+  finalResponse?: string;
 }
 
 export class TaskRegistry {
@@ -118,7 +120,7 @@ export class TaskRegistry {
   }
 
   /** Record a terminal outcome into the bounded history. */
-  archive(taskId: string, finishReason: FinishReason, source: TaskSource): void {
+  archive(taskId: string, finishReason: FinishReason, source: TaskSource, finalResponse?: string): void {
     const record = this.tasks.get(taskId);
     this.history.unshift({
       taskId,
@@ -128,6 +130,7 @@ export class TaskRegistry {
       finishedAt: record?.finishedAt ?? Date.now(),
       durationMs: record?.finishedAt ? record.finishedAt - record.startedAt : 0,
       lastEventType: record?.lastEventType,
+      ...(finalResponse ? { finalResponse } : {}),
     });
     if (this.history.length > this.historyCapacity) this.history.length = this.historyCapacity;
   }

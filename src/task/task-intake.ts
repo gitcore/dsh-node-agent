@@ -129,7 +129,7 @@ export class TaskIntake {
       const source = this.registry.get(taskId)?.source ?? "taskDispatched";
       if (outcome.finishReason === "completed") {
         this.registry.finish(taskId, "completed");
-        this.registry.archive(taskId, "completed", source);
+        this.registry.archive(taskId, "completed", source, outcome.text);
         this.counters.processedTasks++;
         this.log.info("intake", `task ${taskId} completed`, taskId);
         await this.hub.reportTaskEvent({
@@ -140,7 +140,7 @@ export class TaskIntake {
         });
       } else {
         this.registry.finish(taskId, outcome.finishReason);
-        this.registry.archive(taskId, outcome.finishReason, source);
+        this.registry.archive(taskId, outcome.finishReason, source, outcome.text);
         this.counters.failedTasks++;
         this.log.warn("intake", `task ${taskId} finished with reason=${outcome.finishReason}`, taskId);
         await this.hub.reportTaskEvent({

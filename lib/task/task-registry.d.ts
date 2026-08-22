@@ -28,6 +28,8 @@ export interface TaskHistoryEntry {
     finishedAt: number;
     durationMs: number;
     lastEventType?: string;
+    /** Final assistant response text (from the turn/end outcome). */
+    finalResponse?: string;
 }
 export declare class TaskRegistry {
     private readonly historyCapacity;
@@ -52,7 +54,7 @@ export declare class TaskRegistry {
     /** Recent finished tasks, newest first (bounded). */
     recent(): TaskHistoryEntry[];
     /** Record a terminal outcome into the bounded history. */
-    archive(taskId: string, finishReason: FinishReason, source: TaskSource): void;
+    archive(taskId: string, finishReason: FinishReason, source: TaskSource, finalResponse?: string): void;
     /** Stop and dispose every live handle (plugin unload). */
     disposeAll(): Promise<void>;
 }

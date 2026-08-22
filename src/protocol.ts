@@ -241,6 +241,7 @@ export interface RecentTaskView {
   finishedAt: number;
   durationMs: number;
   lastEventType?: string;
+  finalResponse?: string;
 }
 
 export interface MetricsView {
