@@ -1,0 +1,87 @@
+/**
+ * Client half: registers the "集群" sidebar footer action and mounts the
+ * clusterService remote with hand-written strict codecs (the client gateway
+ * rejects src-json descriptors, so every codec is {mode:'strict'} with a
+ * passthrough schema).
+ */
+import type { Context } from "@deepseek-ai/cordis";
+import type { ClientContext } from "@deepseek-ai/dsh-client-runtime/client";
+import type { InvocationDescriptor } from "@deepseek-ai/dsh-typert-protocol";
+// Sidebar slot declarations (sidebar.footer.action) — a real type import forces
+// the ambient SlotMap augmentation into the program.
+import type { SidebarFooterActionOwnerProps } from "@deepseek-ai/dsh-client-ui-sidebar/client";
+import type { ActiveTaskView, ClusterStatusView, MetricsView } from "./protocol.js";
+import type { LogEntry } from "./services/log-buffer.js";
+import { ClusterPanel, type ClusterPanelFace } from "./cluster-view.js";
+
+declare module "@deepseek-ai/dsh-typert-protocol" {
+  interface TypertRemoteNamespaceMap {
+    clusterService: {
+      getStatus(): Promise<ClusterStatusView>;
+      getActiveTasks(): Promise<ActiveTaskView[]>;
+      getLogs(level?: string): Promise<LogEntry[]>;
+      getMetrics(): Promise<MetricsView>;
+    };
+  }
+}
+
+export const inject = ["remote", "remote.clusterService", "slots"];
+export const name = "dsh-node-agent";
+
+const strict = (typeSymbol: string) => ({
+  mode: "strict" as const,
+  typeSymbol,
+  schema: { parse: (value: unknown) => value },
+});
+
+const param = (name: string) => ({
+  name,
+  wire: name,
+  source: "json" as const,
+  codec: strict(`${name}Param`),
+});
+
+const direct = (method: string, parameters: InvocationDescriptor["parameters"] = []): InvocationDescriptor => ({
+  id: `src:clusterService#clusterService/${method}`,
+  service: "clusterService",
+  namespace: "clusterService",
+  method,
+  invocation: { kind: "direct" },
+  parameters,
+  result: strict(`${method}Result`),
+});
+
+const descriptors: InvocationDescriptor[] = [
+  direct("getStatus"),
+  direct("getActiveTasks"),
+  direct("getLogs", [param("level")]),
+  direct("getMetrics"),
+];
+
+export function apply(ctx: ClientContext): void {
+  // Mount the remote namespace (async; teardown waits for the disposer).
+  ctx.effect(() => {
+    const mounting = ctx.remote.$mount({ package: "dsh-node-agent", descriptors });
+    return () => {
+      void mounting.then((dispose) => dispose());
+    };
+  });
+
+  const face = (): ClusterPanelFace => ({
+    getStatus: () => ctx.remote.clusterService.getStatus(),
+    getActiveTasks: () => ctx.remote.clusterService.getActiveTasks(),
+    getLogs: (level?: string) => ctx.remote.clusterService.getLogs(level),
+    getMetrics: () => ctx.remote.clusterService.getMetrics(),
+  });
+
+  ctx.slots.inject("sidebar.footer.action", () =>
+    ctx.slots.register(
+      {
+        name: "sidebar.footer.action",
+        id: "sunset-cluster",
+        inject: face,
+      },
+      ClusterPanel,
+    ),
+  );
+}

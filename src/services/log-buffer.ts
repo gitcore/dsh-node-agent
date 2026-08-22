@@ -42,14 +42,35 @@ export interface Logger {
 
 /** Build a logger writing to both the Cordis logger and the ring buffer. */
 export function createLogger(ctx: Context, buffer: LogBuffer, nodeId: string): Logger {
+  // Cordis uses ctx.root.logger("scope") factory style; sandbox context gates
+  // framework internals like .root, so we defensively probe for a working
+  // logger and fall back to the global console.
+  let cordisLog: ((tag: string) => void) | null = null;
+  try {
+    // NOTE: ctx.root.logger("scope") returns an object with info/warn/error.
+    // Any property access off the sandbox ctx that isn't whitelisted throws,
+    // so probe through ctx.get() (which is always available).
+    const root = (ctx as unknown as { get: (k: string) => unknown }).get("root") as
+      | { logger?: (scope: string) => { info: (s: string) => void; warn: (s: string) => void; error: (s: string) => void } }
+      | undefined;
+    if (typeof root?.logger === "function") {
+      const l = root.logger(`node-agent:${nodeId}`);
+      cordisLog = (tag: string) => l.info?.(tag);
+    }
+  } catch {
+    /* sandbox denied access, ignore */
+  }
+
   const emit = (level: LogLevel, scope: string, message: string, taskId?: string): void => {
-    // taskId omitted when absent: the gateway's JSON-safety check rejects
-    // undefined property values.
     buffer.push({ ts: Date.now(), level, scope, message, ...(taskId ? { taskId } : {}) });
     const tag = `[node-agent:${nodeId}${taskId ? `:${taskId}` : ""}] ${scope}: ${message}`;
-    if (level === "error") ctx.logger.error(tag);
-    else if (level === "warn") ctx.logger.warn(tag);
-    else ctx.logger.info(tag);
+    try {
+      if (level === "error") cordisLog?.(`[ERROR] ${tag}`) ?? console.error(tag);
+      else if (level === "warn") cordisLog?.(`[WARN ] ${tag}`) ?? console.warn(tag);
+      else cordisLog?.(`[INFO ] ${tag}`) ?? console.info(tag);
+    } catch {
+      /* any logging failure must not break the plugin */
+    }
   };
   return {
     info: (scope, message, taskId?) => emit("info", scope, message, taskId),

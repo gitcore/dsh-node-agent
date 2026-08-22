@@ -10,6 +10,13 @@
 #   - the Host loader (imported from the dsh package tree), and
 #   - the profile dir (client-modules createRequire(baseUrl)),
 # e.g. by symlinking/copying it into both node_modules paths (see README §部署).
+#
+# face: host — this loader entry runs ONLY inside the Node Host process;
+# the client UI half is loaded through @deepseek-ai/dsh-client-modules via
+# package.json `dsh.client` + exports["./client"] → lib/client.js.
+# Without face:host the loader would apply the plugin on BOTH faces and
+# crash the host sandbox because Client services (remote, slots) are absent.
 - insert:
     - id: node-agent
       name: dsh-node-agent
+      face: host
