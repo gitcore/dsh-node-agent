@@ -10,6 +10,8 @@ export interface TaskRecord {
     taskId: string;
     status: TaskStatus;
     source: TaskSource;
+    /** A2A conversation context echoed in every reported task event. */
+    contextId?: string;
     startedAt: number;
     finishedAt?: number;
     lastEventType?: string;
@@ -37,7 +39,7 @@ export declare class TaskRegistry {
     private handles;
     private readonly history;
     constructor(historyCapacity?: number);
-    begin(taskId: string, source: TaskSource): TaskRecord;
+    begin(taskId: string, source: TaskSource, contextId?: string): TaskRecord;
     get(taskId: string): TaskRecord | undefined;
     has(taskId: string): boolean;
     attachHandle(taskId: string, handle: AgentHandle): void;

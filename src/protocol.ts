@@ -5,9 +5,6 @@
  */
 import { readFileSync } from "node:fs";
 
-/** A2A message type the coordinator uses to dispatch a task to a node. */
-export const TASK_REQUEST_TYPE = "task.request" as const;
-
 /** Task-event kinds the node reports via `reportTaskEvent` (caller convention). */
 export const TASK_EVENT_KINDS = {
   STARTED: "started",
@@ -44,32 +41,56 @@ export interface ClusterNodeSnapshot {
 
 export interface ClusterTaskDispatch {
   taskId: string;
+  /** A2A conversation context; interpreted by the node, echoed in task events. */
+  contextId?: string | null;
   prompt: string;
   metadata?: Record<string, unknown> | null;
 }
 
 export interface ClusterTaskEvent {
   taskId: string;
+  /** A2A conversation context; echoed from the dispatch once known. */
+  contextId?: string | null;
   kind: string;
   message?: string | null;
   data?: Record<string, unknown> | null;
   timestampUtc?: string;
 }
 
+/** Official A2A v1 part face — only the fields the node consumes. */
+export interface A2APart {
+  text?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Official A2A v1 `Message` model face (A2A `1.0.0-preview2`). The Hub does
+ * not interpret or rewrite any of these fields.
+ */
+export interface A2AMessage {
+  role: string;
+  parts: A2APart[];
+  messageId: string;
+  contextId?: string | null;
+  taskId?: string | null;
+  referenceTaskIds?: string[] | null;
+  extensions?: unknown[] | null;
+  metadata?: Record<string, unknown> | null;
+}
+
 export interface ClusterA2AMessage {
   toNodeId: string;
-  type: string;
   correlationId?: string | null;
-  payload?: Record<string, unknown> | null;
+  message: A2AMessage;
 }
 
 export interface ClusterA2AMessageEnvelope {
+  /** ClusterLink delivery id for dedupe/audit — NOT the A2A messageId. */
   messageId: string;
   fromNodeId: string;
   toNodeId: string;
-  type: string;
   correlationId: string | null;
-  payload: Record<string, unknown> | null;
+  message: A2AMessage;
   timestampUtc: string;
 }
 
@@ -119,6 +140,7 @@ export interface PluginConfigFile {
   eventBufferSize?: number;
   logBufferSize?: number;
   workspace?: string;
+  workspaceRoots?: string[];
   dshVersion?: string;
 }
 
@@ -135,6 +157,12 @@ export interface PluginConfig {
   eventBufferSize: number;
   logBufferSize: number;
   workspace: string;
+  /**
+   * Allowed workspace root directories (hub-api §8): path hints from the hub
+   * are only honored when they resolve inside one of these roots. Empty list
+   * means unrestricted (not recommended for exposed deployments).
+   */
+  workspaceRoots: string[];
   dshVersion: string;
 }
 
@@ -155,6 +183,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PluginConfig {
     eventBufferSize: positiveInt(env.SUNSET_EVENT_BUFFER_SIZE, 1000),
     logBufferSize: positiveInt(env.SUNSET_LOG_BUFFER_SIZE, 500),
     workspace: env.SUNSET_WORKSPACE ?? process.cwd(),
+    workspaceRoots: parseRoots(env.SUNSET_WORKSPACE_ROOTS),
     dshVersion: env.SUNSET_DSH_VERSION ?? DEFAULT_DSH_VERSION,
   };
   // When the process env lacks the required node identity (externally managed
@@ -173,8 +202,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PluginConfig {
     eventBufferSize: file.eventBufferSize ?? fromEnv.eventBufferSize,
     logBufferSize: file.logBufferSize ?? fromEnv.logBufferSize,
     workspace: file.workspace ?? fromEnv.workspace,
+    workspaceRoots: file.workspaceRoots ?? fromEnv.workspaceRoots,
     dshVersion: file.dshVersion ?? fromEnv.dshVersion,
   };
+}
+
+/** Parse a PATH-style (":") separated root list; empty entries are dropped. */
+function parseRoots(value: string | undefined): string[] {
+  return (value ?? "").split(":").map((entry) => entry.trim()).filter((entry) => entry.length > 0);
 }
 
 /** Read and validate the fallback config file; missing/malformed → defaults. */
@@ -186,6 +221,12 @@ export function readConfigFile(path: string): PluginConfigFile {
     const record = parsed as Record<string, unknown>;
     const pickString = (key: string): string | undefined => (typeof record[key] === "string" && record[key] !== "" ? (record[key] as string) : undefined);
     const pickInt = (key: string): number | undefined => (typeof record[key] === "number" && Number.isFinite(record[key] as number) && (record[key] as number) > 0 ? (record[key] as number) : undefined);
+    const pickRoots = (): string[] | undefined => {
+      const raw = record["workspaceRoots"];
+      if (!Array.isArray(raw)) return undefined;
+      const roots = raw.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0).map((entry) => entry.trim());
+      return roots.length > 0 ? roots : undefined;
+    };
     return {
       hubUrl: pickString("hubUrl"),
       nodeToken: pickString("nodeToken"),
@@ -196,6 +237,7 @@ export function readConfigFile(path: string): PluginConfigFile {
       eventBufferSize: pickInt("eventBufferSize"),
       logBufferSize: pickInt("logBufferSize"),
       workspace: pickString("workspace"),
+      workspaceRoots: pickRoots(),
       dshVersion: pickString("dshVersion"),
     };
   } catch {

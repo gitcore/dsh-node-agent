@@ -10,6 +10,8 @@ import type { Logger } from "../services/log-buffer.js";
 
 export interface QueuedEvent {
   taskId: string;
+  /** A2A conversation context, echoed in the progress report. */
+  contextId?: string;
   event: RelayEvent;
 }
 
@@ -51,9 +53,11 @@ export class EventBuffer {
     const flushed = new Set<string>();
     for (const [taskId, events] of byTask) {
       const last = events[events.length - 1];
+      const contextId = this.contextOf(taskId);
       const ok = await hub.reportTaskEvent({
         taskId,
         kind: TASK_EVENT_KINDS.PROGRESS,
+        ...(contextId ? { contextId } : {}),
         data: { seq: last?.seq ?? 0, events },
         timestampUtc: new Date().toISOString(),
       });
@@ -69,4 +73,15 @@ export class EventBuffer {
   clear(): void {
     this.queue = [];
   }
+
+  private contextOf(taskId: string): string | undefined {
+    return this.contextResolver?.(taskId);
+  }
+
+  /** Optional hook so the drain can echo the record's A2A contextId. */
+  setContextResolver(resolve: (taskId: string) => string | undefined): void {
+    this.contextResolver = resolve;
+  }
+
+  private contextResolver: ((taskId: string) => string | undefined) | undefined;
 }

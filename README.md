@@ -71,14 +71,19 @@ Docker 一键方案见仓库根 `Dockerfile`。
 
 任务可以指定会话归属的工作区（否则出现在侧栏"未分组"）。会话 cwd 用工作区路径并 attach 到工作区账目，侧栏即按工作区分组显示。
 
-- **A2A `task.request`**：`payload.workspace` 字段：
+- **A2A `a2aMessageReceived`**：信封 `message` 是官方 A2A v1 `Message`（A2A `1.0.0-preview2`），提示放在 `message.metadata.workspace`，prompt 取全部 text parts 拼接：
   ```json
-  { "type": "task.request", "correlationId": "task-01",
-    "payload": { "prompt": "...", "workspace": "/path/to/dir" } }
+  { "messageId": "delivery-01", "fromNodeId": "12", "correlationId": "task-01",
+    "message": { "role": "ROLE_USER", "parts": [{ "text": "..." }],
+                 "messageId": "msg-01", "contextId": "ctx-01",
+                 "metadata": { "workspace": "/path/to/dir" } } }
   ```
-- **taskDispatched**：`metadata.workspace` 字段（同上）
+  taskId 优先取 `correlationId`，其次 `message.messageId`；`message.contextId` 会随本节点后续所有 `reportTaskEvent` 回传。
+- **taskDispatched**：`metadata.workspace` 字段（同上）；`dispatch.contextId` 同样回传。
 
-`workspace` 可以是：工作区 **id**、**标题**，或**目录路径**（已有工作区直接复用；未注册的路径会先 `mkdir -p` 再自动注册为工作区，保证会话 cwd 可解析、attach 校验通过）。
+`workspace` 可以是：工作区 **id**、**标题**，或**目录路径**（已有工作区直接复用；未注册的绝对路径会先 `mkdir -p` 再自动注册为工作区，保证会话 cwd 可解析、attach 校验通过）。
+
+按 ClusterLink 契约（§8），可用 `SUNSET_WORKSPACE_ROOTS`（`:` 分隔）或配置文件 `workspaceRoots` 限制路径提示只允许落在指定根目录内；未配置时不限制。
 
 ## 卸载清理
 

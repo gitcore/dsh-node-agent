@@ -24,8 +24,10 @@ export declare class TaskIntake {
     private readonly selection;
     constructor(ctx: Context, config: PluginConfig, registry: TaskRegistry, hub: HubConnectionManager, relay: EventRelay, log: Logger, counters: IntakeCounters);
     onTaskDispatched(payload: ClusterTaskDispatch): void;
-    onA2AMessage(message: ClusterA2AMessageEnvelope): void;
+    onA2AMessage(envelope: ClusterA2AMessageEnvelope): void;
     private accept;
+    /** Report one task event with the record's A2A contextId echoed. */
+    private report;
     private run;
     /** Dispose oldest idle agents beyond the cap (their sessions age out). */
     private enforceIdleCap;

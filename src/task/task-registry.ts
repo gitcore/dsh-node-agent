@@ -12,6 +12,8 @@ export interface TaskRecord {
   taskId: string;
   status: TaskStatus;
   source: TaskSource;
+  /** A2A conversation context echoed in every reported task event. */
+  contextId?: string;
   startedAt: number;
   finishedAt?: number;
   lastEventType?: string;
@@ -42,8 +44,9 @@ export class TaskRegistry {
 
   constructor(private readonly historyCapacity = 20) {}
 
-  begin(taskId: string, source: TaskSource): TaskRecord {
+  begin(taskId: string, source: TaskSource, contextId?: string): TaskRecord {
     const record: TaskRecord = { taskId, status: "starting", source, startedAt: Date.now(), seq: 0 };
+    if (contextId) record.contextId = contextId;
     this.tasks.set(taskId, record);
     return record;
   }

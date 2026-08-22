@@ -1,5 +1,3 @@
-/** A2A message type the coordinator uses to dispatch a task to a node. */
-export declare const TASK_REQUEST_TYPE: "task.request";
 /** Task-event kinds the node reports via `reportTaskEvent` (caller convention). */
 export declare const TASK_EVENT_KINDS: {
     readonly STARTED: "started";
@@ -31,29 +29,51 @@ export interface ClusterNodeSnapshot {
 }
 export interface ClusterTaskDispatch {
     taskId: string;
+    /** A2A conversation context; interpreted by the node, echoed in task events. */
+    contextId?: string | null;
     prompt: string;
     metadata?: Record<string, unknown> | null;
 }
 export interface ClusterTaskEvent {
     taskId: string;
+    /** A2A conversation context; echoed from the dispatch once known. */
+    contextId?: string | null;
     kind: string;
     message?: string | null;
     data?: Record<string, unknown> | null;
     timestampUtc?: string;
 }
+/** Official A2A v1 part face — only the fields the node consumes. */
+export interface A2APart {
+    text?: string;
+    [key: string]: unknown;
+}
+/**
+ * Official A2A v1 `Message` model face (A2A `1.0.0-preview2`). The Hub does
+ * not interpret or rewrite any of these fields.
+ */
+export interface A2AMessage {
+    role: string;
+    parts: A2APart[];
+    messageId: string;
+    contextId?: string | null;
+    taskId?: string | null;
+    referenceTaskIds?: string[] | null;
+    extensions?: unknown[] | null;
+    metadata?: Record<string, unknown> | null;
+}
 export interface ClusterA2AMessage {
     toNodeId: string;
-    type: string;
     correlationId?: string | null;
-    payload?: Record<string, unknown> | null;
+    message: A2AMessage;
 }
 export interface ClusterA2AMessageEnvelope {
+    /** ClusterLink delivery id for dedupe/audit — NOT the A2A messageId. */
     messageId: string;
     fromNodeId: string;
     toNodeId: string;
-    type: string;
     correlationId: string | null;
-    payload: Record<string, unknown> | null;
+    message: A2AMessage;
     timestampUtc: string;
 }
 /** One relayed session event with its per-task monotonic forward seq. */
@@ -88,6 +108,7 @@ export interface PluginConfigFile {
     eventBufferSize?: number;
     logBufferSize?: number;
     workspace?: string;
+    workspaceRoots?: string[];
     dshVersion?: string;
 }
 /** Resolved plugin configuration (SUNSET_* env vars, see requirements-v3 §4). */
@@ -103,6 +124,12 @@ export interface PluginConfig {
     eventBufferSize: number;
     logBufferSize: number;
     workspace: string;
+    /**
+     * Allowed workspace root directories (hub-api §8): path hints from the hub
+     * are only honored when they resolve inside one of these roots. Empty list
+     * means unrestricted (not recommended for exposed deployments).
+     */
+    workspaceRoots: string[];
     dshVersion: string;
 }
 export declare function loadConfig(env?: NodeJS.ProcessEnv): PluginConfig;

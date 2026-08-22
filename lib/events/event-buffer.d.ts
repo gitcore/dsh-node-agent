@@ -9,6 +9,8 @@ import type { HubConnectionManager } from "../connection/hub-connection.js";
 import type { Logger } from "../services/log-buffer.js";
 export interface QueuedEvent {
     taskId: string;
+    /** A2A conversation context, echoed in the progress report. */
+    contextId?: string;
     event: RelayEvent;
 }
 export declare class EventBuffer {
@@ -26,4 +28,8 @@ export declare class EventBuffer {
      */
     drain(hub: HubConnectionManager, log: Logger): Promise<number>;
     clear(): void;
+    private contextOf;
+    /** Optional hook so the drain can echo the record's A2A contextId. */
+    setContextResolver(resolve: (taskId: string) => string | undefined): void;
+    private contextResolver;
 }

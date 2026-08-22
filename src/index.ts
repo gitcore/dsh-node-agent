@@ -29,6 +29,7 @@ export function apply(ctx: Context): void {
   const registry = new TaskRegistry();
   const counters: IntakeCounters = { processedTasks: 0, failedTasks: 0 };
   const eventBuffer = new EventBuffer(config.eventBufferSize);
+  eventBuffer.setContextResolver((taskId) => registry.get(taskId)?.contextId);
 
   let intake: TaskIntake;
 
