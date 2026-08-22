@@ -158,12 +158,23 @@ export class TaskIntake {
       this.log.error("intake", `task ${taskId} crashed: ${detail}`, taskId);
       await this.hub.reportTaskEvent({ taskId, kind: TASK_EVENT_KINDS.FAILED, message: `execution error: ${detail}` });
     } finally {
-      try {
-        await handle.dispose();
-      } catch {
-        /* ignore */
-      }
+      // Deliberately NOT handle.dispose(): dispose would remove the session
+      // from the store and the sidebar conversation vanishes. The agent stays
+      // idle and its session stays live so the user can open it and read the
+      // result; idle agents are capped by enforceIdleCap().
       this.registry.delete(taskId);
+      void this.enforceIdleCap();
+    }
+  }
+
+  /** Dispose oldest idle agents beyond the cap (their sessions age out). */
+  private async enforceIdleCap(): Promise<void> {
+    try {
+      const keep = Math.max(this.config.maxConcurrency * 3, 6);
+      const disposed = await this.registry.disposeIdleBeyond(keep);
+      for (const taskId of disposed) this.log.info("intake", `disposed idle agent/session ${taskId} (cap ${keep})`);
+    } catch (error) {
+      this.log.warn("intake", `idle-cap enforcement failed: ${errorMessage(error)}`);
     }
   }
 }

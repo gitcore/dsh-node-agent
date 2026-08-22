@@ -50,11 +50,24 @@ export declare class TaskRegistry {
     activeCount(): number;
     list(): TaskRecord[];
     listActive(): TaskRecord[];
+    /**
+     * Remove the task record only. The AgentHandle is intentionally KEPT: the
+     * agent's session must stay live after completion so the web-ui sidebar
+     * keeps the conversation and the user can open it to read the result.
+     * Idle handles are capped by {@link disposeIdleBeyond}.
+     */
     delete(taskId: string): void;
     /** Recent finished tasks, newest first (bounded). */
     recent(): TaskHistoryEntry[];
     /** Record a terminal outcome into the bounded history. */
     archive(taskId: string, finishReason: FinishReason, source: TaskSource, finalResponse?: string): void;
+    /**
+     * Dispose idle agent handles beyond `keep`, oldest first (handles whose task
+     * record is gone = completed). Disposing removes their sessions from the
+     * live store, so old task conversations age out of the sidebar in bounded
+     * numbers. Returns the disposed taskIds.
+     */
+    disposeIdleBeyond(keep: number): Promise<string[]>;
     /** Stop and dispose every live handle (plugin unload). */
     disposeAll(): Promise<void>;
 }

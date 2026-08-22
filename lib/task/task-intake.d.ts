@@ -27,4 +27,6 @@ export declare class TaskIntake {
     onA2AMessage(message: ClusterA2AMessageEnvelope): void;
     private accept;
     private run;
+    /** Dispose oldest idle agents beyond the cap (their sessions age out). */
+    private enforceIdleCap;
 }
