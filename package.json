@@ -37,6 +37,7 @@
     "clean": "rm -rf lib"
   },
   "dependencies": {
+    "@a2a-js/sdk": "^1.0.1",
     "@microsoft/signalr": "^8.0.7"
   },
   "peerDependencies": {

@@ -71,7 +71,7 @@ Docker 一键方案见仓库根 `Dockerfile`。
 
 任务可以指定会话归属的工作区（否则出现在侧栏"未分组"）。会话 cwd 用工作区路径并 attach 到工作区账目，侧栏即按工作区分组显示。
 
-- **A2A `a2aMessageReceived`**：信封 `message` 是官方 A2A v1 `Message`（A2A `1.0.0-preview2`），提示放在 `message.metadata.workspace`，prompt 取全部 text parts 拼接：
+- **A2A `a2aMessageReceived`**：信封 `message` 是官方 A2A v1 `Message`，用官方 SDK `@a2a-js/sdk` 解析；提示放在 `message.metadata.workspace`，prompt 取全部 text parts 拼接：
   ```json
   { "messageId": "delivery-01", "fromNodeId": "12", "correlationId": "task-01",
     "message": { "role": "ROLE_USER", "parts": [{ "text": "..." }],

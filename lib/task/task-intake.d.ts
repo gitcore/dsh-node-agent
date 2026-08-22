@@ -1,8 +1,3 @@
-/**
- * Task intake: dual-channel acceptance (taskDispatched + a2a task.request),
- * in-process agent/session creation via ctx.agents.create, started/failed
- * reporting, and the run-to-completion driver with final report.
- */
 import type { Context } from "@deepseek-ai/cordis";
 import { type ClusterA2AMessageEnvelope, type ClusterTaskDispatch, type PluginConfig } from "../protocol.js";
 import { type HubConnectionManager } from "../connection/hub-connection.js";

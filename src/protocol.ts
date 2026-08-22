@@ -57,26 +57,8 @@ export interface ClusterTaskEvent {
   timestampUtc?: string;
 }
 
-/** Official A2A v1 part face — only the fields the node consumes. */
-export interface A2APart {
-  text?: string;
-  [key: string]: unknown;
-}
-
-/**
- * Official A2A v1 `Message` model face (A2A `1.0.0-preview2`). The Hub does
- * not interpret or rewrite any of these fields.
- */
-export interface A2AMessage {
-  role: string;
-  parts: A2APart[];
-  messageId: string;
-  contextId?: string | null;
-  taskId?: string | null;
-  referenceTaskIds?: string[] | null;
-  extensions?: unknown[] | null;
-  metadata?: Record<string, unknown> | null;
-}
+/** Official A2A v1 `Message` model (from `@a2a-js/sdk`, wire-compatible with the hub's .NET A2A model). */
+export type A2AMessage = import("@a2a-js/sdk").Message;
 
 export interface ClusterA2AMessage {
   toNodeId: string;

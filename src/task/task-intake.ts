@@ -3,11 +3,12 @@
  * in-process agent/session creation via ctx.agents.create, started/failed
  * reporting, and the run-to-completion driver with final report.
  */
+import { Message } from "@a2a-js/sdk";
 import type { Context } from "@deepseek-ai/cordis";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { installModelSelection, type AgentHandle, type ModelSelection } from "@deepseek-ai/dsh-agent";
-import { TASK_EVENT_KINDS, type A2APart, type ClusterA2AMessageEnvelope, type ClusterTaskDispatch, type ClusterTaskEvent, type PluginConfig } from "../protocol.js";
+import { TASK_EVENT_KINDS, type A2AMessage, type ClusterA2AMessageEnvelope, type ClusterTaskDispatch, type ClusterTaskEvent, type PluginConfig } from "../protocol.js";
 import { errorMessage, type HubConnectionManager } from "../connection/hub-connection.js";
 import type { TaskRegistry, TaskSource } from "./task-registry.js";
 import type { EventRelay } from "../events/event-relay.js";
@@ -60,26 +61,35 @@ export class TaskIntake {
   }
 
   onA2AMessage(envelope: ClusterA2AMessageEnvelope): void {
-    // The envelope's message is an official A2A v1 Message; the prompt is the
-    // concatenated text parts and the workspace hint rides in metadata.
-    const message = envelope?.message;
-    const parts: readonly A2APart[] = Array.isArray(message?.parts) ? message.parts : [];
-    const prompt = parts.filter((part) => typeof part?.text === "string").map((part) => part.text ?? "").join("").trim();
+    // The envelope's message is an official A2A v1 Message; parse it with the
+    // official SDK (wire-compatible with the hub's .NET A2A model).
+    let message: A2AMessage;
+    try {
+      message = Message.fromJSON(envelope?.message as never);
+    } catch (error) {
+      this.log.error("intake", `invalid A2A message (deliveryId=${envelope?.messageId ?? "?"} from=${envelope?.fromNodeId ?? "?"}): ${errorMessage(error)}`);
+      return;
+    }
+    // The prompt is the concatenated text parts; the workspace hint rides in metadata.
+    const prompt = message.parts
+      .map((part) => (part.content?.$case === "text" ? part.content.value : ""))
+      .join("")
+      .trim();
     if (prompt.length === 0) {
-      this.log.warn("intake", `a2a message without text parts (deliveryId=${envelope?.messageId ?? "?"} from=${envelope?.fromNodeId ?? "?"})`);
+      this.log.warn("intake", `a2a message without text parts (deliveryId=${envelope.messageId ?? "?"} from=${envelope.fromNodeId ?? "?"})`);
       return;
     }
     const correlationId = typeof envelope.correlationId === "string" ? envelope.correlationId.trim() : "";
-    const innerMessageId = typeof message?.messageId === "string" ? message.messageId.trim() : "";
+    const innerMessageId = typeof message.messageId === "string" ? message.messageId.trim() : "";
     const taskId = correlationId.length > 0 ? correlationId : innerMessageId.length > 0 ? innerMessageId : `a2a-${envelope.messageId ?? Date.now()}`;
-    const metadata = message?.metadata && typeof message.metadata === "object" ? { ...message.metadata } : {};
+    const metadata = message.metadata && typeof message.metadata === "object" ? { ...message.metadata } : {};
     const workspaceHint = metadata.workspace;
     void this.accept(
       taskId,
       prompt,
       { ...metadata, deliveryId: envelope.messageId, fromNodeId: envelope.fromNodeId },
       "a2a",
-      contextIdOf(message?.contextId),
+      contextIdOf(message.contextId),
       workspaceHint,
     );
   }
