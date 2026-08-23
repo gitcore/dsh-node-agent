@@ -62,7 +62,7 @@ const triggerStyle: React.CSSProperties = {
   width: "100%",
 };
 
-export function ClusterPanel({ wide, getStatus, getActiveTasks, getRecentTasks, getLogs, getMetrics }: ClusterPanelProps): React.JSX.Element | null {
+export function ClusterPanel({ wide, getStatus, getActiveTasks, getRecentTasks, getLogs, getMetrics, connectToHub }: ClusterPanelProps): React.JSX.Element | null {
   const [open, setOpen] = useState(false);
   return (
     <>
