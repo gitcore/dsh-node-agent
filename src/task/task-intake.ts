@@ -101,6 +101,10 @@ export class TaskIntake {
       workspaceHint: metadata?.workspace,
       dshSessionHint: contextIdOf(metadata?.sessionId),
       metadata,
+    }).catch((error) => {
+      // Safety net: an intake bug must degrade to a failed task report,
+      // never an unhandled rejection that takes down the host process.
+      this.log.error("intake", `taskDispatched accept crashed: ${errorMessage(error)}`, taskId);
     });
   }
 
@@ -131,6 +135,9 @@ export class TaskIntake {
       contextId: contextIdOf(message.contextId),
       workspaceHint: metadata.workspace,
       metadata: { ...metadata, deliveryId: envelope.messageId, fromNodeId: envelope.fromNodeId },
+    }).catch((error) => {
+      // Safety net: see onTaskDispatched.
+      this.log.error("intake", `a2a accept crashed: ${errorMessage(error)}`);
     });
   }
 
@@ -280,6 +287,24 @@ export class TaskIntake {
     if (request.contextId && !this.contexts.has(request.contextId)) {
       this.log.warn("intake", `${channel} task ${taskId} rejected: unknown contextId ${request.contextId}`, taskId);
       await this.reportWith(taskId, request.contextId, { kind: TASK_EVENT_KINDS.FAILED, message: "unknown contextId" });
+      return;
+    }
+
+    // Known contextId + new task = conversation continuation: reuse the
+    // existing record and its confirmed DSH session instead of calling
+    // create() again (it throws "context already exists", whose unhandled
+    // rejection used to kill the whole host process → container restart).
+    if (request.contextId) {
+      const existing = this.contexts.get(request.contextId);
+      if (!existing) return;
+      const knownConflict = this.checkBindingConflicts(existing, request);
+      if (knownConflict) {
+        this.log.warn("intake", `${channel} task ${taskId} rejected: ${knownConflict}`, taskId);
+        await this.reportWith(taskId, request.contextId, { kind: TASK_EVENT_KINDS.FAILED, message: knownConflict });
+        return;
+      }
+      this.log.info("intake", `${channel} continues known context ${request.contextId} with new task ${taskId}`, taskId);
+      this.beginAndQueue(taskId, request.contextId, channel, request.prompt);
       return;
     }
 

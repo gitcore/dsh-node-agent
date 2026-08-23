@@ -237,6 +237,27 @@ test("two tasks in one context serialize; both run on ONE dsh session", async ()
   assert.equal(h.createdSessions.length, 1);
 });
 
+test("taskDispatched with a KNOWN contextId + new taskId continues the conversation (regression: used to crash via 'context already exists')", async () => {
+  const h = makeHarness();
+  // Seed one context with a context-less dispatch.
+  h.intake.onTaskDispatched({ taskId: "coord-task-1", prompt: "seed" });
+  await waitFor(() => h.counters.processedTasks === 1, "seed done");
+  const first = h.taskEvents.find((e) => e.kind === "started");
+  assert.ok(first.contextId, "context generated for context-less dispatch");
+  const createsAfterSeed = h.createdSessions.length;
+
+  // Pre-fix crash scenario: a NEW coordinator taskId carrying an EXISTING
+  // contextId reached startNewContextTask -> contexts.create() threw
+  // "context already exists"; its unhandled rejection killed the host process.
+  h.intake.onTaskDispatched({ taskId: "coord-task-2", prompt: "follow-up", contextId: first.contextId });
+  await waitFor(() => h.taskEvents.filter((e) => e.kind === "started").length === 2, "follow-up started");
+  const second = h.taskEvents.filter((e) => e.kind === "started")[1];
+  assert.equal(second.taskId, "coord-task-2", "coordinator-provided identity kept");
+  assert.equal(second.contextId, first.contextId, "same conversation context");
+  await waitFor(() => h.counters.processedTasks === 2, "follow-up done");
+  assert.equal(h.createdSessions.length, createsAfterSeed, "reused the existing dsh session; no re-create attempt");
+});
+
 test("relay drops events for node-owned sessions without an active task", async () => {
   const h = makeHarness();
   h.intake.onA2AMessage(a2aEnvelope({ text: "hello" }));
