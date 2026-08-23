@@ -85,6 +85,12 @@ Docker 一键方案见仓库根 `Dockerfile`。
 
 按 ClusterLink 契约（§8），可用 `SUNSET_WORKSPACE_ROOTS`（`:` 分隔）或配置文件 `workspaceRoots` 限制路径提示只允许落在指定根目录内；未配置时不限制。
 
+## 会话上下文与续聊
+
+- `contextId` 由调度方提供；**首条消息省略时由节点生成 UUID**，并通过后续所有 `reportTaskEvent`（started/progress/completed/failed）的 `contextId` 字段回传——调度方从任意事件里取值即可。
+- **继续同一会话**：用相同 `taskId` 再次下发（可带相同 `contextId`）。节点对仍存活的会话直接复用（保留对话历史）；超过空闲上限被回收的会话则开新会话。
+- 活跃任务重复下发相同 `taskId` 会被拒绝（duplicate taskId）。
+
 ## 卸载清理
 
 插件卸载（fiber dispose）时：停止 SignalR 连接、取消并 dispose 所有进行中的 agent、清空事件/日志缓冲。
