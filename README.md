@@ -85,11 +85,16 @@ Docker 一键方案见仓库根 `Dockerfile`。
 
 按 ClusterLink 契约（§8），可用 `SUNSET_WORKSPACE_ROOTS`（`:` 分隔）或配置文件 `workspaceRoots` 限制路径提示只允许落在指定根目录内；未配置时不限制。
 
-## 会话上下文与续聊
+## 会话上下文与续聊（A2A v1 §3.4 语义）
 
-- `contextId` 由调度方提供；**首条消息省略时由节点生成 UUID**，并通过后续所有 `reportTaskEvent`（started/progress/completed/failed）的 `contextId` 字段回传——调度方从任意事件里取值即可。
-- **继续同一会话**：用相同 `taskId` 再次下发（可带相同 `contextId`）。节点对仍存活的会话直接复用（保留对话历史）；超过空闲上限被回收的会话则开新会话。
-- 活跃任务重复下发相同 `taskId` 会被拒绝（duplicate taskId）。
+- **`contextId` 标识会话（对话），`taskId` 只标识会话内的单个任务单元。**
+- DSH 会话绑定在 `contextId` 上：同一 context 的所有任务共享同一个会话，对话历史自然延续（Context Inheritance）。
+- **首条消息**省略 `contextId` 时由节点生成 UUID，并随后续所有 `reportTaskEvent`（started/progress/completed/failed）回传——调度方从任意事件取值。
+- **同一对话开新任务**：新 `taskId` + 相同 `contextId` → 加入既有会话。
+- **继续既有任务**：相同 `taskId` 再次下发（可带相同 `contextId`）→ contextId 从任务历史推断；不带 contextId 同样生效。
+- **mismatch 拒绝**：`taskId` 已知但其记录的 context 与传入 `contextId` 不一致时，任务被拒绝（FAILED: contextId does not match the referenced task）。
+- 同一会话内的并发下发按到达顺序串行执行（不交叉）；活跃任务重复下发相同 `taskId` 仍会被拒绝（duplicate taskId）。
+- 会话 cwd 由该对话的第一个任务决定；后续任务的 workspace 提示不改变已存在会话的 cwd。超过空闲上限（`maxConcurrency × 3`）的会话会被回收，之后同 context 下发将开启新会话。
 
 ## 卸载清理
 

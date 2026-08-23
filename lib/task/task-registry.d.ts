@@ -10,8 +10,8 @@ export interface TaskRecord {
     taskId: string;
     status: TaskStatus;
     source: TaskSource;
-    /** A2A conversation context echoed in every reported task event. */
-    contextId?: string;
+    /** A2A conversation context (= session key); echoed in every reported task event. */
+    contextId: string;
     startedAt: number;
     finishedAt?: number;
     lastEventType?: string;
@@ -35,14 +35,21 @@ export interface TaskHistoryEntry {
 }
 export declare class TaskRegistry {
     private readonly historyCapacity;
+    private readonly contextMemoryCapacity;
     private tasks;
+    /** Live agent handles keyed by session key (= A2A contextId). */
     private handles;
+    /** taskId → contextId for every accepted task (survives deletion; bounded). */
+    private contexts;
     private readonly history;
-    constructor(historyCapacity?: number);
-    begin(taskId: string, source: TaskSource, contextId?: string): TaskRecord;
+    constructor(historyCapacity?: number, contextMemoryCapacity?: number);
+    begin(taskId: string, source: TaskSource, contextId: string): TaskRecord;
+    /** Last known contextId of a task — including finished/deleted ones (bounded memory). */
+    knownContextOf(taskId: string): string | undefined;
     get(taskId: string): TaskRecord | undefined;
     has(taskId: string): boolean;
     attachHandle(taskId: string, handle: AgentHandle): void;
+    getHandleBySession(sessionKey: string): AgentHandle | undefined;
     getHandle(taskId: string): AgentHandle | undefined;
     setRunning(taskId: string): void;
     touch(taskId: string, eventType: string): void;
@@ -64,10 +71,10 @@ export declare class TaskRegistry {
     /** Record a terminal outcome into the bounded history. */
     archive(taskId: string, finishReason: FinishReason, source: TaskSource, finalResponse?: string): void;
     /**
-     * Dispose idle agent handles beyond `keep`, oldest first (handles whose task
-     * record is gone = completed). Disposing removes their sessions from the
-     * live store, so old task conversations age out of the sidebar in bounded
-     * numbers. Returns the disposed taskIds.
+     * Dispose idle agent handles beyond `keep`, oldest first (handles whose
+     * context has no active task = completed). Disposing removes their sessions
+     * from the live store, so old task conversations age out of the sidebar in
+     * bounded numbers. Returns the disposed session keys.
      */
     disposeIdleBeyond(keep: number): Promise<string[]>;
     /** Stop and dispose every live handle (plugin unload). */

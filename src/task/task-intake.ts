@@ -107,51 +107,61 @@ export class TaskIntake {
       return;
     }
 
-    // Per the ClusterLink contract the node generates the A2A conversation
-    // context when the dispatch omits it, then echoes it in every subsequent
-    // task event so the dispatcher can continue the conversation.
-    const resolvedContextId = contextId ?? randomUUID();
+    // A2A v1 semantics (spec §3.4): the contextId identifies the conversation,
+    // the taskId a unit of work within it. A known taskId infers its context;
+    // a provided contextId that contradicts the referenced task is rejected.
+    const knownContext = this.registry.knownContextOf(taskId);
+    if (contextId && knownContext && contextId !== knownContext) {
+      this.log.warn("intake", `task ${taskId} rejected: contextId ${contextId} does not match the referenced task context ${knownContext}`, taskId);
+      await this.reportWith(taskId, contextId, { kind: TASK_EVENT_KINDS.FAILED, message: "contextId does not match the referenced task" });
+      return;
+    }
+    // Per the ClusterLink contract the node generates the conversation context
+    // when neither the dispatch nor task history provides one, then echoes it
+    // in every subsequent task event so the dispatcher can continue.
+    const resolvedContextId = knownContext ?? contextId ?? randomUUID();
     this.registry.begin(taskId, source, resolvedContextId);
-    this.log.info("intake", `accepting task ${taskId} (source=${source}, context=${resolvedContextId}${contextId ? "" : ", generated"})`, taskId);
+    this.log.info("intake", `accepting task ${taskId} (source=${source}, context=${resolvedContextId}${knownContext ? ", inferred" : contextId ? "" : ", generated"})`, taskId);
     // Resolve the target workspace before creating the session (its path
     // becomes the session cwd, which is half of workspace membership).
     const workspace = await resolveWorkspace(this.ctx, this.config, workspaceHint, this.log);
     const cwd = workspace?.path ?? this.config.workspace;
     if (workspace) this.log.info("intake", `task ${taskId} -> workspace ${workspace.path}`, taskId);
     try {
-      // Continuation: a re-dispatch with a known taskId reuses the still-live
-      // agent/session (kept alive after completion up to the idle cap), so
-      // the conversation history carries over. Only a fresh taskId creates a
-      // new session.
-      const existingHandle = this.registry.getHandle(taskId);
+      // The DSH session is bound to the conversation (contextId), so every
+      // task in the same context shares one session and its history carries
+      // over (A2A Context Inheritance). Only an unknown context creates a new
+      // session.
+      const existingHandle = this.registry.getHandleBySession(resolvedContextId);
       const handle = existingHandle ?? await this.ctx.agents.create({
-        sessionId: SessionId(taskId),
+        sessionId: SessionId(resolvedContextId),
         meta: { cwd },
         agentOptions: this.selection ? { provider: this.selection.provider, model: this.selection.model } : undefined,
         setup: (agentCtx) => {
           if (this.selection) installModelSelection(agentCtx, { current: this.selection, assembled: void 0 });
         },
       });
-      if (existingHandle) this.log.info("intake", `task ${taskId} continues existing session`, taskId);
+      if (existingHandle) this.log.info("intake", `task ${taskId} joins existing conversation ${resolvedContextId}`, taskId);
       this.registry.attachHandle(taskId, handle);
       // Attach the session to the workspace account (the other half of
-      // membership) so the sidebar groups it under that workspace.
+      // membership) so the sidebar groups it under that workspace. The first
+      // task of a conversation fixes the session cwd; later tasks in the same
+      // conversation keep it.
       if (workspace && !existingHandle) {
         try {
-          await workspace.attach(taskId);
+          await workspace.attach(handle.agent.session.id);
         } catch (error) {
           this.log.warn("intake", `workspace attach failed for ${taskId}: ${errorMessage(error)}`, taskId);
         }
       }
       this.registry.setRunning(taskId);
-      this.relay.attach(taskId);
       const accepted = await this.report(taskId, {
         kind: TASK_EVENT_KINDS.STARTED,
         message: "node accepted the task",
-        data: { sessionId: taskId, source, ...(workspace ? { workspace: workspace.path } : {}) },
+        data: { sessionId: handle.agent.session.id, source, ...(workspace ? { workspace: workspace.path } : {}) },
       });
-      if (!accepted) this.log.warn("intake", `started event not delivered (hub offline); session ${taskId} is running`, taskId);
-      void this.run(taskId, handle, prompt);
+      if (!accepted) this.log.warn("intake", `started event not delivered (hub offline); session is running`, taskId);
+      void this.enqueueRun(resolvedContextId, taskId, handle, prompt);
     } catch (error) {
       this.registry.finish(taskId, "error");
       this.registry.archive(taskId, "error", source);
@@ -165,7 +175,10 @@ export class TaskIntake {
 
   /** Report one task event with the record's A2A contextId echoed. */
   private async report(taskId: string, event: Omit<ClusterTaskEvent, "taskId" | "contextId" | "timestampUtc"> & { data?: Record<string, unknown> }): Promise<boolean> {
-    const contextId = this.registry.get(taskId)?.contextId;
+    return this.reportWith(taskId, this.registry.get(taskId)?.contextId, event);
+  }
+
+  private async reportWith(taskId: string, contextId: string | undefined, event: Omit<ClusterTaskEvent, "taskId" | "contextId" | "timestampUtc"> & { data?: Record<string, unknown> }): Promise<boolean> {
     return this.hub.reportTaskEvent({
       ...event,
       taskId,
@@ -174,11 +187,28 @@ export class TaskIntake {
     });
   }
 
-  private async run(taskId: string, handle: AgentHandle, prompt: string): Promise<void> {
+  /**
+   * Serialize turns per conversation: concurrent dispatches into one context
+   * run their followups strictly in order instead of interleaving on the
+   * shared agent/session.
+   */
+  private readonly sessionQueues = new Map<string, Promise<void>>();
+
+  private enqueueRun(sessionKey: string, taskId: string, handle: AgentHandle, prompt: string): void {
+    const prev = this.sessionQueues.get(sessionKey) ?? Promise.resolve();
+    const next = prev.then(() => this.runTurn(sessionKey, taskId, handle, prompt));
+    this.sessionQueues.set(sessionKey, next);
+    void next.finally(() => {
+      if (this.sessionQueues.get(sessionKey) === next) this.sessionQueues.delete(sessionKey);
+    });
+  }
+
+  private async runTurn(sessionKey: string, taskId: string, handle: AgentHandle, prompt: string): Promise<void> {
     const { agent } = handle;
     try {
       await agent.whenIdle();
       const firstSeq = agent.session.seq;
+      this.relay.attach(taskId, sessionKey);
       agent.followup(createUserMessage({ content: [{ type: "text", text: prompt }], source: { kind: "user" } }));
       await agent.whenIdle();
       await this.ctx.sessions.flush(agent.session);

@@ -23,7 +23,15 @@ export declare class TaskIntake {
     private accept;
     /** Report one task event with the record's A2A contextId echoed. */
     private report;
-    private run;
+    private reportWith;
+    /**
+     * Serialize turns per conversation: concurrent dispatches into one context
+     * run their followups strictly in order instead of interleaving on the
+     * shared agent/session.
+     */
+    private readonly sessionQueues;
+    private enqueueRun;
+    private runTurn;
     /** Dispose oldest idle agents beyond the cap (their sessions age out). */
     private enforceIdleCap;
 }

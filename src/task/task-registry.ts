@@ -12,8 +12,8 @@ export interface TaskRecord {
   taskId: string;
   status: TaskStatus;
   source: TaskSource;
-  /** A2A conversation context echoed in every reported task event. */
-  contextId?: string;
+  /** A2A conversation context (= session key); echoed in every reported task event. */
+  contextId: string;
   startedAt: number;
   finishedAt?: number;
   lastEventType?: string;
@@ -39,16 +39,32 @@ export interface TaskHistoryEntry {
 
 export class TaskRegistry {
   private tasks = new Map<string, TaskRecord>();
+  /** Live agent handles keyed by session key (= A2A contextId). */
   private handles = new Map<string, AgentHandle>();
+  /** taskId → contextId for every accepted task (survives deletion; bounded). */
+  private contexts = new Map<string, string>();
   private readonly history: TaskHistoryEntry[] = [];
 
-  constructor(private readonly historyCapacity = 20) {}
+  constructor(
+    private readonly historyCapacity = 20,
+    private readonly contextMemoryCapacity = 1000,
+  ) {}
 
-  begin(taskId: string, source: TaskSource, contextId?: string): TaskRecord {
-    const record: TaskRecord = { taskId, status: "starting", source, startedAt: Date.now(), seq: 0 };
-    if (contextId) record.contextId = contextId;
+  begin(taskId: string, source: TaskSource, contextId: string): TaskRecord {
+    const record: TaskRecord = { taskId, status: "starting", source, contextId, startedAt: Date.now(), seq: 0 };
     this.tasks.set(taskId, record);
+    this.contexts.set(taskId, contextId);
+    while (this.contexts.size > this.contextMemoryCapacity) {
+      const oldest = this.contexts.keys().next().value;
+      if (oldest === undefined) break;
+      this.contexts.delete(oldest);
+    }
     return record;
+  }
+
+  /** Last known contextId of a task — including finished/deleted ones (bounded memory). */
+  knownContextOf(taskId: string): string | undefined {
+    return this.tasks.get(taskId)?.contextId ?? this.contexts.get(taskId);
   }
 
   get(taskId: string): TaskRecord | undefined {
@@ -60,11 +76,17 @@ export class TaskRegistry {
   }
 
   attachHandle(taskId: string, handle: AgentHandle): void {
-    this.handles.set(taskId, handle);
+    const sessionKey = this.knownContextOf(taskId);
+    if (sessionKey) this.handles.set(sessionKey, handle);
+  }
+
+  getHandleBySession(sessionKey: string): AgentHandle | undefined {
+    return this.handles.get(sessionKey);
   }
 
   getHandle(taskId: string): AgentHandle | undefined {
-    return this.handles.get(taskId);
+    const sessionKey = this.knownContextOf(taskId);
+    return sessionKey ? this.handles.get(sessionKey) : undefined;
   }
 
   setRunning(taskId: string): void {
@@ -144,23 +166,27 @@ export class TaskRegistry {
   }
 
   /**
-   * Dispose idle agent handles beyond `keep`, oldest first (handles whose task
-   * record is gone = completed). Disposing removes their sessions from the
-   * live store, so old task conversations age out of the sidebar in bounded
-   * numbers. Returns the disposed taskIds.
+   * Dispose idle agent handles beyond `keep`, oldest first (handles whose
+   * context has no active task = completed). Disposing removes their sessions
+   * from the live store, so old task conversations age out of the sidebar in
+   * bounded numbers. Returns the disposed session keys.
    */
   async disposeIdleBeyond(keep: number): Promise<string[]> {
-    const idle = [...this.handles.entries()].filter(([taskId]) => !this.tasks.has(taskId));
+    const activeSessions = new Set<string>();
+    for (const record of this.tasks.values()) {
+      if (record.status === "starting" || record.status === "running") activeSessions.add(record.contextId);
+    }
+    const idle = [...this.handles.entries()].filter(([sessionKey]) => !activeSessions.has(sessionKey));
     const excess = idle.length > keep ? idle.slice(0, idle.length - keep) : [];
     const disposed: string[] = [];
-    for (const [taskId, handle] of excess) {
+    for (const [sessionKey, handle] of excess) {
       try {
         await handle.dispose();
       } catch {
         /* ignore */
       }
-      this.handles.delete(taskId);
-      disposed.push(taskId);
+      this.handles.delete(sessionKey);
+      disposed.push(sessionKey);
     }
     return disposed;
   }
