@@ -27,4 +27,8 @@ export declare class ClusterService extends TypertRemoteService {
     getRecentTasks(): RecentTaskView[];
     getLogs(level?: string): LogEntry[];
     getMetrics(): MetricsView;
+    /** Manual connect: idempotent; safe to call while auto-retry is pending. */
+    connectToHub(): {
+        state: string;
+    };
 }

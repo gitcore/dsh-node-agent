@@ -17,6 +17,7 @@ export interface ClusterPanelFace {
   getRecentTasks(): Promise<RecentTaskView[]>;
   getLogs(level?: string): Promise<LogEntry[]>;
   getMetrics(): Promise<MetricsView>;
+  connectToHub(): Promise<{ state: string }>;
 }
 
 export type ClusterPanelProps = PropsRuntime<"sidebar.footer.action"> & InjectFace<ClusterPanelFace>;
@@ -77,7 +78,7 @@ export function ClusterPanel({ wide, getStatus, getActiveTasks, getRecentTasks, 
         <span style={{ fontSize: 14, lineHeight: 1 }}>◎</span>
         {wide && <span>集群</span>}
       </button>
-      {open && <ClusterDialog getStatus={getStatus} getActiveTasks={getActiveTasks} getRecentTasks={getRecentTasks} getLogs={getLogs} getMetrics={getMetrics} onClose={() => setOpen(false)} />}
+      {open && <ClusterDialog getStatus={getStatus} getActiveTasks={getActiveTasks} getRecentTasks={getRecentTasks} getLogs={getLogs} getMetrics={getMetrics} connectToHub={connectToHub} onClose={() => setOpen(false)} />}
     </>
   );
 }
@@ -115,7 +116,7 @@ function TaskHistoryRow({ task }: { task: RecentTaskView }): React.JSX.Element {
   );
 }
 
-function ClusterDialog({ getStatus, getActiveTasks, getRecentTasks, getLogs, getMetrics, onClose }: ClusterDialogProps): React.JSX.Element | null {
+function ClusterDialog({ getStatus, getActiveTasks, getRecentTasks, getLogs, getMetrics, connectToHub, onClose }: ClusterDialogProps): React.JSX.Element | null {
   const [status, setStatus] = useState<ClusterStatusView | null>(null);
   const [tasks, setTasks] = useState<ActiveTaskView[]>([]);
   const [recent, setRecent] = useState<RecentTaskView[]>([]);
@@ -123,6 +124,19 @@ function ClusterDialog({ getStatus, getActiveTasks, getRecentTasks, getLogs, get
   const [metrics, setMetrics] = useState<MetricsView | null>(null);
   const [level, setLevel] = useState<string>("all");
   const [error, setError] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+
+  const onConnect = async () => {
+    if (connecting) return;
+    setConnecting(true);
+    try {
+      await connectToHub();
+    } catch {
+      /* status poll surfaces the failure */
+    } finally {
+      setConnecting(false);
+    }
+  };
 
   useEffect(() => {
     let alive = true;
@@ -185,6 +199,27 @@ function ClusterDialog({ getStatus, getActiveTasks, getRecentTasks, getLogs, get
             <span style={{ color: C.dim }}>连接状态</span>
             <span style={{ color: stateColor, fontWeight: 600 }}>{status ? status.state : "…"}</span>
           </div>
+          {status && !status.connected && (
+            <button
+              type="button"
+              onClick={() => void onConnect()}
+              disabled={connecting}
+              style={{
+                marginTop: 8,
+                width: "100%",
+                padding: "6px 0",
+                borderRadius: 8,
+                border: `1px solid ${C.accent}`,
+                background: connecting ? "transparent" : C.accent,
+                color: connecting ? C.accent : "#fff",
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: connecting ? "default" : "pointer",
+              }}
+            >
+              {connecting ? "连接中…" : "连接服务器"}
+            </button>
+          )}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px", marginTop: 8, color: C.text }}>
             <span style={{ color: C.dim }}>Hub</span><span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{status?.hubUrl ?? "-"}</span>
             <span style={{ color: C.dim }}>节点 ID</span><span>{status?.nodeId ?? "-"}</span>

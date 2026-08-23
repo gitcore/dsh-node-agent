@@ -75,6 +75,33 @@ export class HubConnectionManager {
 
   async start(): Promise<void> {
     if (this.stopped) return;
+    if (this.starting) return this.starting;
+    this.starting = this.runStart().finally(() => {
+      this.starting = undefined;
+    });
+    await this.starting;
+  }
+
+  /** Manual-connect entrypoint: idempotent, safe while auto-retry is pending. */
+  requestConnect(): ConnectionState {
+    if (this.stopped || this.isConnected || this.starting) return this._state;
+    void this.start().catch(() => {
+      /* runStart logs internally */
+    });
+    return this._state;
+  }
+
+  private starting: Promise<void> | undefined;
+
+  private async runStart(): Promise<void> {
+    // A manual connect cancels any pending backoff retry and skips when a
+    // connection is already being established or established.
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = undefined;
+    }
+    if (this.isConnected) return;
+    if (this.connection && this.connection.state !== HubConnectionState.Disconnected) return;
     if (!this.config.nodeId || !this.config.nodeToken) {
       this.setState("misconfigured");
       this.log.error("connection", "missing SUNSET_NODE_ID or SUNSET_NODE_TOKEN; plugin stays offline");

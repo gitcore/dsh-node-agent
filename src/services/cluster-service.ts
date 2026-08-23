@@ -100,4 +100,11 @@ export class ClusterService extends TypertRemoteService {
       droppedEvents: eventBuffer.droppedCount,
     };
   }
+
+  /** Manual connect: idempotent; safe to call while auto-retry is pending. */
+  @Remote
+  connectToHub(): { state: string } {
+    const state = this.deps.hub.requestConnect();
+    return { state };
+  }
 }

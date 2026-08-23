@@ -39,6 +39,10 @@ export declare class HubConnectionManager {
     get connectedForMs(): number;
     get eventMetrics(): HubEventMetrics;
     start(): Promise<void>;
+    /** Manual-connect entrypoint: idempotent, safe while auto-retry is pending. */
+    requestConnect(): ConnectionState;
+    private starting;
+    private runStart;
     private scheduleRetry;
     private register;
     private startHeartbeat;

@@ -22,6 +22,7 @@ declare module "@deepseek-ai/dsh-typert-protocol" {
       getRecentTasks(): Promise<RemoteResult<RecentTaskView[]>>;
       getLogs(level?: string): Promise<RemoteResult<LogEntry[]>>;
       getMetrics(): Promise<RemoteResult<MetricsView>>;
+      connectToHub(): Promise<RemoteResult<{ state: string }>>;
     };
   }
 }
@@ -98,6 +99,7 @@ const descriptors: InvocationDescriptor[] = [
   direct("getRecentTasks"),
   direct("getLogs", [param("level")]),
   direct("getMetrics"),
+  direct("connectToHub"),
 ];
 
 export function apply(ctx: ClientContext): void {
@@ -146,6 +148,7 @@ export function apply(ctx: ClientContext): void {
         getRecentTasks: async () => { throw notReady; },
         getLogs: async (level?: string) => { throw notReady; },
         getMetrics: async () => { throw notReady; },
+        connectToHub: async () => { throw notReady; },
       } as ClientContext["remote"]["clusterService"];
     }
     return service;
@@ -160,6 +163,7 @@ export function apply(ctx: ClientContext): void {
     getRecentTasks: () => unwrap(cluster().getRecentTasks()),
     getLogs: (level?: string) => unwrap(cluster().getLogs(level)),
     getMetrics: () => unwrap(cluster().getMetrics()),
+    connectToHub: () => unwrap(cluster().connectToHub()),
   });
 
   slots.inject("sidebar.footer.action", () =>
