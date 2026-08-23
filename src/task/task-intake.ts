@@ -1,17 +1,30 @@
 /**
- * Task intake: dual-channel acceptance (taskDispatched + a2a task.request),
- * in-process agent/session creation via ctx.agents.create, started/failed
- * reporting, and the run-to-completion driver with final report.
+ * Task intake: dual-channel acceptance (taskDispatched + a2aMessageReceived),
+ * normative A2A ID validation, context/task selection, and the serialized
+ * run-to-completion driver.
+ *
+ * Semantics follow A2A v1.0 §3.4 plus the frozen DSH policy in
+ * docs/todolist/pending/dsh-a2a-context-session-mapping.md:
+ *  - contextId identifies the conversation (1:1 with one DSH session via the
+ *    context registry; the dshSessionId is opaque and never derived from an
+ *    A2A id);
+ *  - taskId identifies one stateful task record inside that context;
+ *  - server-owned IDs: unknown taskIds are TaskNotFoundError, unknown
+ *    contextIds are rejected without substitute generation, and new tasks get
+ *    server-generated taskIds on the A2A channel;
+ *  - prompts into one context are strictly serialized (submitted FIFO ->
+ *    working -> terminal; input-required holds the queue).
  */
 import { randomUUID } from "node:crypto";
-import { Message } from "@a2a-js/sdk";
+import { Message, TaskState as A2aTaskState, TaskStatusUpdateEvent } from "@a2a-js/sdk";
 import type { Context } from "@deepseek-ai/cordis";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { installModelSelection, type AgentHandle, type ModelSelection } from "@deepseek-ai/dsh-agent";
 import { TASK_EVENT_KINDS, type A2AMessage, type ClusterA2AMessageEnvelope, type ClusterTaskDispatch, type ClusterTaskEvent, type PluginConfig } from "../protocol.js";
 import { errorMessage, type HubConnectionManager } from "../connection/hub-connection.js";
-import type { TaskRegistry, TaskSource } from "./task-registry.js";
+import { ContextRegistry } from "./context-registry.js";
+import { isTerminalState, type TaskSource, type TaskState, type TaskRegistry } from "./task-registry.js";
 import type { EventRelay } from "../events/event-relay.js";
 import type { Logger } from "../services/log-buffer.js";
 import { summarizeOutcome } from "./task-completion.js";
@@ -30,13 +43,35 @@ function contextIdOf(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 
+/** Official A2A TaskStatusUpdateEvent wire JSON built through the official SDK serializer. */
+function statusUpdateEventJson(taskId: string, contextId: string, state: TaskState): Record<string, unknown> {
+  const a2aState = {
+    submitted: A2aTaskState.TASK_STATE_SUBMITTED,
+    working: A2aTaskState.TASK_STATE_WORKING,
+    completed: A2aTaskState.TASK_STATE_COMPLETED,
+    failed: A2aTaskState.TASK_STATE_FAILED,
+    canceled: A2aTaskState.TASK_STATE_CANCELED,
+    rejected: A2aTaskState.TASK_STATE_REJECTED,
+    "input-required": A2aTaskState.TASK_STATE_INPUT_REQUIRED,
+    "auth-required": A2aTaskState.TASK_STATE_AUTH_REQUIRED,
+  }[state];
+  return TaskStatusUpdateEvent.toJSON(TaskStatusUpdateEvent.fromJSON({ taskId, contextId, status: { state: a2aState } })) as Record<string, unknown>;
+}
+
 export class TaskIntake {
   private readonly selection: ModelSelection | undefined;
+  /** Live agent handles keyed by the confirmed canonical dshSessionId. */
+  private readonly handles = new Map<string, AgentHandle>();
+  /** Per-context turn FIFO: prompts into one conversation never interleave. */
+  private readonly sessionQueues = new Map<string, Promise<void>>();
+  /** Next prompt per queued task (the context FIFO only carries task ids). */
+  private readonly pendingTurns = new Map<string, string>();
 
   constructor(
     private readonly ctx: Context,
     private readonly config: PluginConfig,
     private readonly registry: TaskRegistry,
+    private readonly contexts: ContextRegistry,
     private readonly hub: HubConnectionManager,
     private readonly relay: EventRelay,
     private readonly log: Logger,
@@ -57,13 +92,19 @@ export class TaskIntake {
       this.log.warn("intake", `invalid taskDispatched payload: ${JSON.stringify({ taskId, hasPrompt: typeof prompt === "string" })}`);
       return;
     }
-    const workspaceHint = payload?.metadata && typeof payload.metadata === "object" ? (payload.metadata as Record<string, unknown>).workspace : undefined;
-    void this.accept(taskId, prompt, payload.metadata, "taskDispatched", contextIdOf(payload.contextId), workspaceHint);
+    const metadata = payload?.metadata && typeof payload.metadata === "object" ? (payload.metadata as Record<string, unknown>) : undefined;
+    void this.accept({
+      channel: "taskDispatched",
+      requestedTaskId: taskId,
+      prompt,
+      contextId: contextIdOf(payload.contextId),
+      workspaceHint: metadata?.workspace,
+      dshSessionHint: contextIdOf(metadata?.sessionId),
+      metadata,
+    });
   }
 
   onA2AMessage(envelope: ClusterA2AMessageEnvelope): void {
-    // The envelope's message is an official A2A v1 Message; parse it with the
-    // official SDK (wire-compatible with the hub's .NET A2A model).
     let message: A2AMessage;
     try {
       message = Message.fromJSON(envelope?.message as never);
@@ -71,7 +112,6 @@ export class TaskIntake {
       this.log.error("intake", `invalid A2A message (deliveryId=${envelope?.messageId ?? "?"} from=${envelope?.fromNodeId ?? "?"}): ${errorMessage(error)}`);
       return;
     }
-    // The prompt is the concatenated text parts; the workspace hint rides in metadata.
     const prompt = message.parts
       .map((part) => (part.content?.$case === "text" ? part.content.value : ""))
       .join("")
@@ -80,102 +120,368 @@ export class TaskIntake {
       this.log.warn("intake", `a2a message without text parts (deliveryId=${envelope.messageId ?? "?"} from=${envelope.fromNodeId ?? "?"})`);
       return;
     }
-    const correlationId = typeof envelope.correlationId === "string" ? envelope.correlationId.trim() : "";
-    const innerMessageId = typeof message.messageId === "string" ? message.messageId.trim() : "";
-    const taskId = correlationId.length > 0 ? correlationId : innerMessageId.length > 0 ? innerMessageId : `a2a-${envelope.messageId ?? Date.now()}`;
     const metadata = message.metadata && typeof message.metadata === "object" ? { ...message.metadata } : {};
-    const workspaceHint = metadata.workspace;
-    void this.accept(
-      taskId,
+    void this.accept({
+      channel: "a2a",
+      // Server-owned IDs: a client-provided taskId may only REFERENCE an
+      // existing task; new tasks always get a server-generated id.
+      requestedTaskId: contextIdOf(message.taskId),
+      generateTaskId: true,
       prompt,
-      { ...metadata, deliveryId: envelope.messageId, fromNodeId: envelope.fromNodeId },
-      "a2a",
-      contextIdOf(message.contextId),
-      workspaceHint,
-    );
+      contextId: contextIdOf(message.contextId),
+      workspaceHint: metadata.workspace,
+      metadata: { ...metadata, deliveryId: envelope.messageId, fromNodeId: envelope.fromNodeId },
+    });
   }
 
-  private async accept(taskId: string, prompt: string, metadata: Record<string, unknown> | null | undefined, source: TaskSource, contextId?: string, workspaceHint?: unknown): Promise<void> {
-    if (this.registry.has(taskId)) {
-      this.log.warn("intake", `duplicate taskId ${taskId}; rejecting`, taskId);
-      await this.reportWith(taskId, this.registry.knownContextOf(taskId), { kind: TASK_EVENT_KINDS.FAILED, message: "duplicate taskId" });
-      return;
-    }
+  // ------------------------------------------------------------------
+  // ID resolution (normative A2A rules + frozen DSH policy)
+  // ------------------------------------------------------------------
+
+  private async accept(request: {
+    channel: TaskSource;
+    requestedTaskId?: string;
+    generateTaskId?: boolean;
+    prompt: string;
+    contextId?: string;
+    workspaceHint?: unknown;
+    dshSessionHint?: string;
+    metadata?: Record<string, unknown> | null;
+  }): Promise<void> {
+    const { channel, requestedTaskId, prompt } = request;
+
     if (this.registry.activeCount() >= this.config.maxConcurrency) {
-      this.log.warn("intake", `max concurrency (${this.config.maxConcurrency}) reached; rejecting ${taskId}`, taskId);
-      await this.reportWith(taskId, this.registry.knownContextOf(taskId), { kind: TASK_EVENT_KINDS.FAILED, message: `max concurrency reached (${this.config.maxConcurrency})` });
+      this.log.warn("intake", `max concurrency (${this.config.maxConcurrency}) reached; rejecting ${requestedTaskId ?? "(new)"}`, requestedTaskId);
+      await this.reportWith(requestedTaskId ?? "unknown", request.contextId, { kind: TASK_EVENT_KINDS.FAILED, message: `max concurrency reached (${this.config.maxConcurrency})` });
       return;
     }
 
-    // A2A v1 semantics (spec §3.4): the contextId identifies the conversation,
-    // the taskId a unit of work within it. A known taskId infers its context;
-    // a provided contextId that contradicts the referenced task is rejected.
-    const knownContext = this.registry.knownContextOf(taskId);
-    if (contextId && knownContext && contextId !== knownContext) {
-      this.log.warn("intake", `task ${taskId} rejected: contextId ${contextId} does not match the referenced task context ${knownContext}`, taskId);
-      await this.reportWith(taskId, contextId, { kind: TASK_EVENT_KINDS.FAILED, message: "contextId does not match the referenced task" });
+    // No taskId on the A2A channel: either continue an existing context with
+    // a new server-generated task, or start a brand-new conversation.
+    if (requestedTaskId === undefined) {
+      if (request.contextId && !this.contexts.has(request.contextId)) {
+        // Server-owned context policy: an explicit but unknown contextId
+        // cannot be accepted and MUST NOT be replaced by a generated one.
+        this.log.warn("intake", `a2a message rejected: unknown contextId ${request.contextId}`);
+        await this.reportWith("(unresolved)", request.contextId, { kind: TASK_EVENT_KINDS.FAILED, message: "unknown contextId" });
+        return;
+      }
+      if (request.contextId) {
+        const record = this.contexts.get(request.contextId);
+        if (!record) return;
+        const conflict = this.checkBindingConflicts(record, request);
+        if (conflict) {
+          this.log.warn("intake", `a2a message rejected: ${conflict}`, request.contextId);
+          await this.reportWith("(unresolved)", request.contextId, { kind: TASK_EVENT_KINDS.FAILED, message: conflict });
+          return;
+        }
+        const taskId = randomUUID();
+        this.log.info("intake", `a2a continues conversation ${request.contextId} with new task ${taskId}`, taskId);
+        this.beginAndQueue(taskId, request.contextId, channel, prompt);
+        return;
+      }
+      return this.startNewContextTask(channel, randomUUID(), request);
+    }
+
+    // A live task record is referenced directly.
+    const liveRecord = this.registry.get(requestedTaskId);
+    if (liveRecord) {
+      const contextRecord = this.contexts.get(liveRecord.contextId);
+      if (!contextRecord) {
+        this.log.error("intake", `task ${requestedTaskId} references missing context ${liveRecord.contextId}; rejecting`, requestedTaskId);
+        await this.reportWith(requestedTaskId, liveRecord.contextId, { kind: TASK_EVENT_KINDS.FAILED, message: "task context unavailable" });
+        return;
+      }
+      if (request.contextId && request.contextId !== liveRecord.contextId) {
+        this.log.warn("intake", `${channel} task ${requestedTaskId} rejected: contextId ${request.contextId} does not match the referenced task context ${liveRecord.contextId}`, requestedTaskId);
+        await this.reportWith(requestedTaskId, request.contextId, { kind: TASK_EVENT_KINDS.FAILED, message: "contextId does not match the referenced task" });
+        return;
+      }
+      const conflict = this.checkBindingConflicts(contextRecord, request);
+      if (conflict) {
+        this.log.warn("intake", `${channel} task ${requestedTaskId} rejected: ${conflict}`, requestedTaskId);
+        await this.reportWith(requestedTaskId, liveRecord.contextId, { kind: TASK_EVENT_KINDS.FAILED, message: conflict });
+        return;
+      }
+      if (liveRecord.state === "input-required") {
+        // Only a follow-up on the same taskId continues a held task.
+        this.registry.transition(requestedTaskId, "working");
+        this.log.info("intake", `task ${requestedTaskId} resumes from input-required`, requestedTaskId);
+        this.enqueueRun(liveRecord.contextId, requestedTaskId, prompt);
+        return;
+      }
+      if (!isTerminalState(liveRecord.state)) {
+        this.log.warn("intake", `task ${requestedTaskId} is ${liveRecord.state}; rejecting concurrent message`, requestedTaskId);
+        await this.reportWith(requestedTaskId, liveRecord.contextId, { kind: TASK_EVENT_KINDS.FAILED, message: `task is ${liveRecord.state}` });
+        return;
+      }
+      // Terminal live record: reject on the coordinator channel; on the A2A
+      // channel the conversation continues with a NEW server-generated task.
+      if (!request.generateTaskId) {
+        this.log.warn("intake", `task ${requestedTaskId} is terminal (${liveRecord.state}); send its contextId ${liveRecord.contextId} to start a new task`, requestedTaskId);
+        await this.reportWith(requestedTaskId, liveRecord.contextId, { kind: TASK_EVENT_KINDS.FAILED, message: `task is ${liveRecord.state}; use its contextId to start a new task` });
+        return;
+      }
+      const taskId = randomUUID();
+      this.log.info("intake", `${channel} continues conversation ${liveRecord.contextId} with new task ${taskId}`, taskId);
+      this.beginAndQueue(taskId, liveRecord.contextId, channel, prompt);
       return;
     }
-    // Per the ClusterLink contract the node generates the conversation context
-    // when neither the dispatch nor task history provides one, then echoes it
-    // in every subsequent task event so the dispatcher can continue.
-    const resolvedContextId = knownContext ?? contextId ?? randomUUID();
-    this.registry.begin(taskId, source, resolvedContextId);
-    this.log.info("intake", `accepting task ${taskId} (source=${source}, context=${resolvedContextId}${knownContext ? ", inferred" : contextId ? "" : ", generated"})`, taskId);
-    // Resolve the target workspace before creating the session (its path
-    // becomes the session cwd, which is half of workspace membership).
-    const workspace = await resolveWorkspace(this.ctx, this.config, workspaceHint, this.log);
+
+    // Normative rule: a provided taskId MUST reference an existing task.
+    const knownTaskContext = this.registry.knownContextOf(requestedTaskId);
+    if (knownTaskContext === undefined) {
+      if (!request.generateTaskId) {
+        // taskDispatched: the coordinator owns taskId assignment; an unknown
+        // id starts a new task under the coordinator-provided identity.
+        return this.startNewContextTask(channel, requestedTaskId, request);
+      }
+      // A2A: unknown taskId is TaskNotFoundError — no replacement task,
+      // session, or context may be created.
+      this.log.warn("intake", `a2a message references unknown taskId ${requestedTaskId}; rejecting (task not found)`, requestedTaskId);
+      await this.reportWith(requestedTaskId, request.contextId, { kind: TASK_EVENT_KINDS.FAILED, message: "task not found" });
+      return;
+    }
+
+    // The referenced task is terminal (its live record was already removed);
+    // the bounded context memory still resolves it. A contradicting explicit
+    // contextId MUST be rejected with zero side effects.
+    const contextRecord = this.contexts.get(knownTaskContext);
+    if (!contextRecord) {
+      this.log.error("intake", `task ${requestedTaskId} references missing context ${knownTaskContext}; rejecting`, requestedTaskId);
+      await this.reportWith(requestedTaskId, knownTaskContext, { kind: TASK_EVENT_KINDS.FAILED, message: "task context unavailable" });
+      return;
+    }
+    if (request.contextId && request.contextId !== knownTaskContext) {
+      this.log.warn("intake", `${channel} task ${requestedTaskId} rejected: contextId ${request.contextId} does not match the referenced task context ${knownTaskContext}`, requestedTaskId);
+      await this.reportWith(requestedTaskId, request.contextId, { kind: TASK_EVENT_KINDS.FAILED, message: "contextId does not match the referenced task" });
+      return;
+    }
+    const conflict = this.checkBindingConflicts(contextRecord, request);
+    if (conflict) {
+      this.log.warn("intake", `${channel} task ${requestedTaskId} rejected: ${conflict}`, requestedTaskId);
+      await this.reportWith(requestedTaskId, knownTaskContext, { kind: TASK_EVENT_KINDS.FAILED, message: conflict });
+      return;
+    }
+    if (!request.generateTaskId) {
+      this.log.warn("intake", `task ${requestedTaskId} already finished; send its contextId ${knownTaskContext} to start a new task`, requestedTaskId);
+      await this.reportWith(requestedTaskId, knownTaskContext, { kind: TASK_EVENT_KINDS.FAILED, message: `task already finished; use its contextId to start a new task` });
+      return;
+    }
+    const taskId = randomUUID();
+    this.log.info("intake", `${channel} continues conversation ${knownTaskContext} with new task ${taskId}`, taskId);
+    this.beginAndQueue(taskId, knownTaskContext, channel, prompt);
+  }
+
+  /** First contact (or a context-less dispatch): create context + task. */
+  private async startNewContextTask(channel: TaskSource, taskId: string, request: { prompt: string; contextId?: string; workspaceHint?: unknown; dshSessionHint?: string; metadata?: Record<string, unknown> | null }): Promise<void> {
+    // Server-owned context policy: an explicit but unknown contextId cannot be
+    // accepted and MUST NOT be replaced by a generated one.
+    if (request.contextId && !this.contexts.has(request.contextId)) {
+      this.log.warn("intake", `${channel} task ${taskId} rejected: unknown contextId ${request.contextId}`, taskId);
+      await this.reportWith(taskId, request.contextId, { kind: TASK_EVENT_KINDS.FAILED, message: "unknown contextId" });
+      return;
+    }
+
+    const workspace = await resolveWorkspace(this.ctx, this.config, request.workspaceHint, this.log);
     const cwd = workspace?.path ?? this.config.workspace;
     if (workspace) this.log.info("intake", `task ${taskId} -> workspace ${workspace.path}`, taskId);
-    this.registry.setRunning(taskId);
-    // The DSH session is bound to the conversation (contextId); report the
-    // session identity immediately, then acquire the handle inside the
-    // per-conversation queue so concurrent dispatches into one context can
-    // never create the same session twice.
-    const accepted = await this.report(taskId, {
-      kind: TASK_EVENT_KINDS.STARTED,
-      message: "node accepted the task",
-      data: { sessionId: resolvedContextId, source, ...(workspace ? { workspace: workspace.path } : {}) },
-    });
-    if (!accepted) this.log.warn("intake", `started event not delivered (hub offline); task queued`, taskId);
-    void this.enqueueRun(resolvedContextId, taskId, source, prompt, cwd, workspace);
+
+    // Provisional context record; rolled back if the DSH session never confirms.
+    const record = this.contexts.create(request.contextId ?? randomUUID(), { resolved: workspace?.path, hint: typeof request.workspaceHint === "string" ? request.workspaceHint : undefined });
+    const contextId = record.contextId;
+    this.log.info("intake", `creating context ${contextId}${request.contextId ? "" : " (generated)"}`, taskId);
+    try {
+      // Creation seed: transport-private hint or an opaque node-generated key
+      // — never an A2A id. The canonical dshSessionId is whatever DSH
+      // confirms back.
+      const seed = request.dshSessionHint ?? randomUUID();
+      const handle = await this.ctx.agents.create({
+        sessionId: SessionId(seed),
+        meta: { cwd },
+        agentOptions: this.selection ? { provider: this.selection.provider, model: this.selection.model } : undefined,
+        setup: (agentCtx) => {
+          if (this.selection) installModelSelection(agentCtx, { current: this.selection, assembled: void 0 });
+        },
+      });
+      this.handles.set(handle.agent.session.id, handle);
+      this.contexts.confirmSession(contextId, handle.agent.session.id);
+      if (workspace) {
+        try {
+          await workspace.attach(handle.agent.session.id);
+        } catch (error) {
+          this.log.warn("intake", `workspace attach failed for context ${contextId}: ${errorMessage(error)}`, taskId);
+        }
+      }
+      this.log.info("intake", `context ${contextId} bound to dsh session ${handle.agent.session.id}`, taskId);
+    } catch (error) {
+      this.contexts.deleteIfUnconfirmed(contextId);
+      this.counters.failedTasks++;
+      const detail = errorMessage(error).slice(0, 300);
+      this.log.error("intake", `dsh session create failed for context ${contextId}: ${detail}`, taskId);
+      await this.reportWith(taskId, contextId, { kind: TASK_EVENT_KINDS.FAILED, message: `dsh session create failed: ${detail}` });
+      return;
+    }
+
+    this.beginAndQueue(taskId, contextId, channel, request.prompt);
   }
 
-  /**
-   * Acquire the live handle for a conversation session. Must run inside the
-   * per-conversation queue: two dispatches racing into one otherwise-fresh
-   * context would both see no handle and create the same session twice.
-   */
-  private async acquireSessionHandle(taskId: string, sessionKey: string, cwd: string, workspace: Awaited<ReturnType<typeof resolveWorkspace>>): Promise<AgentHandle> {
-    const existing = this.registry.getHandleBySession(sessionKey);
-    if (existing) {
-      this.log.info("intake", `task ${taskId} joins existing conversation ${sessionKey}`, taskId);
-      return existing;
-    }
-    const handle = await this.ctx.agents.create({
-      sessionId: SessionId(sessionKey),
-      meta: { cwd },
-      agentOptions: this.selection ? { provider: this.selection.provider, model: this.selection.model } : undefined,
-      setup: (agentCtx) => {
-        if (this.selection) installModelSelection(agentCtx, { current: this.selection, assembled: void 0 });
-      },
+  /** Shared tail: register the task record, announce it, and queue its turn. */
+  private beginAndQueue(taskId: string, contextId: string, channel: TaskSource, prompt: string): void {
+    this.registry.begin(taskId, contextId, channel);
+    void this.emitStatus(taskId, "submitted");
+    const record = this.registry.get(taskId);
+    const dshSessionId = this.contexts.get(contextId)?.dshSessionId;
+    void this.reportWith(taskId, contextId, {
+      kind: TASK_EVENT_KINDS.STARTED,
+      message: "node accepted the task",
+      data: { source: channel, state: record?.state, ...(dshSessionId ? { sessionId: dshSessionId } : {}), ...(record ? { createdAt: record.createdAt } : {}) },
     });
-    this.registry.attachHandle(taskId, handle);
-    // Attach the session to the workspace account (the other half of
-    // membership) so the sidebar groups it under that workspace.
-    if (workspace) {
-      try {
-        await workspace.attach(handle.agent.session.id);
-      } catch (error) {
-        this.log.warn("intake", `workspace attach failed for ${taskId}: ${errorMessage(error)}`, taskId);
-      }
+    this.contexts.enqueueTask(contextId, taskId);
+    this.pendingTurns.set(taskId, prompt);
+    this.pump(contextId);
+  }
+
+  /** Workspace / private-session binding checks against an existing context. */
+  private checkBindingConflicts(record: { workspaceHint?: string; dshSessionId: string }, request: { workspaceHint?: unknown; dshSessionHint?: string }): string | undefined {
+    if (typeof request.workspaceHint === "string" && record.workspaceHint && request.workspaceHint !== record.workspaceHint) {
+      return `workspace conflict: context is bound to ${JSON.stringify(record.workspaceHint)}`;
     }
+    if (request.dshSessionHint && record.dshSessionId && request.dshSessionHint !== record.dshSessionId) {
+      return "DshSessionMismatch: private sessionId does not match the context session";
+    }
+    return undefined;
+  }
+
+  // ------------------------------------------------------------------
+  // Per-context serialized execution
+  // ------------------------------------------------------------------
+
+  /** Start the next queued turn unless a task is still active in the context. */
+  private pump(contextId: string): void {
+    const record = this.contexts.get(contextId);
+    if (!record || record.activeTaskId) return;
+    let head = record.queuedTaskIds.shift();
+    while (head && !this.registry.get(head)) head = record.queuedTaskIds.shift();
+    if (!head) return;
+    try {
+      this.registry.transition(head, "working");
+    } catch (error) {
+      this.log.error("intake", `task ${head} cannot enter working: ${errorMessage(error)}`, head);
+      return;
+    }
+    this.contexts.setActiveTask(contextId, head);
+    void this.emitStatus(head, "working");
+    const prompt = this.pendingTurns.get(head) ?? "";
+    this.pendingTurns.delete(head);
+    void this.executeTurn(contextId, head, prompt);
+  }
+
+  private enqueueRun(contextId: string, taskId: string, prompt: string): void {
+    const prev = this.sessionQueues.get(contextId) ?? Promise.resolve();
+    const next = prev.then(() => this.executeTurn(contextId, taskId, prompt));
+    this.sessionQueues.set(contextId, next);
+    void next.finally(() => {
+      if (this.sessionQueues.get(contextId) === next) this.sessionQueues.delete(contextId);
+    });
+  }
+
+  private async executeTurn(contextId: string, taskId: string, prompt: string): Promise<void> {
+    const record = this.registry.get(taskId);
+    const context = this.contexts.get(contextId);
+    if (!record || !context) return;
+    try {
+      const handle = await this.acquireSessionHandle(context.dshSessionId);
+      const { agent } = handle;
+      await agent.whenIdle();
+      const firstSeq = agent.session.seq;
+      agent.followup(createUserMessage({ content: [{ type: "text", text: prompt }], source: { kind: "user" } }));
+      await agent.whenIdle();
+      await this.ctx.sessions.flush(agent.session);
+
+      const outcome = summarizeOutcome(agent.session.events, firstSeq);
+      if (outcome.finishReason === "blocked") {
+        // input-required holds the queue: the same taskId must be continued.
+        this.registry.transition(taskId, "input-required");
+        await this.emitStatus(taskId, "input-required");
+        await this.report(taskId, { kind: TASK_EVENT_KINDS.PROGRESS, message: "waiting for input", data: { state: "input-required" } });
+        this.log.info("intake", `task ${taskId} waits for input; queue held`, taskId);
+        return;
+      }
+      const state: TaskState = outcome.finishReason === "completed" ? "completed" : "failed";
+      this.settle(taskId, state, outcome.text, outcome.errorCode, outcome.errorMessage);
+    } catch (error) {
+      const detail = errorMessage(error).slice(0, 300);
+      this.log.error("intake", `task ${taskId} crashed: ${detail}`, taskId);
+      this.settle(taskId, "failed", undefined, "execution-error", detail);
+    } finally {
+      const latest = this.registry.get(taskId);
+      if (!latest || isTerminalState(latest.state)) {
+        // Terminal records leave the live map (bounded); the context memory
+        // keeps taskId -> contextId for later inference. input-required tasks
+        // stay live and keep holding the conversation.
+        if (latest) this.registry.delete(taskId);
+        if (context.activeTaskId === taskId) {
+          context.activeTaskId = null;
+          this.pump(contextId);
+        }
+      }
+      void this.enforceIdleCap();
+    }
+  }
+
+  private settle(taskId: string, state: TaskState, finalResponse?: string, errorCode?: string, errorMessageText?: string): void {
+    const source = this.registry.get(taskId)?.source ?? "taskDispatched";
+    try {
+      this.registry.transition(taskId, state);
+    } catch (error) {
+      this.log.error("intake", `task ${taskId} terminal transition failed: ${errorMessage(error)}`, taskId);
+      return;
+    }
+    this.registry.setResult(taskId, { finishReason: state === "completed" ? "completed" : "error", ...(finalResponse ? { finalResponse } : {}), ...(errorCode ? { errorCode } : {}), ...(errorMessageText ? { errorMessage: errorMessageText.slice(0, 300) } : {}) });
+    this.registry.archive(taskId, state, finalResponse);
+    if (state === "completed") this.counters.processedTasks++;
+    else this.counters.failedTasks++;
+    void this.emitStatus(taskId, state);
+    if (state === "completed") {
+      const text = finalResponse ?? "";
+      this.log.info("intake", `task ${taskId} completed`, taskId);
+      void this.report(taskId, { kind: TASK_EVENT_KINDS.COMPLETED, message: "task completed", data: { finalResponse: text, finishReason: "completed" } });
+    } else {
+      this.log.warn("intake", `task ${taskId} finished with state=${state}`, taskId);
+      void this.report(taskId, {
+        kind: TASK_EVENT_KINDS.FAILED,
+        data: { state, errorCode: errorCode ?? null, errorMessage: errorMessageText?.slice(0, 300) ?? null },
+      });
+    }
+  }
+
+  /** Announce an A2A state transition as an official TaskStatusUpdateEvent. */
+  private async emitStatus(taskId: string, state: TaskState): Promise<void> {
+    const record = this.registry.get(taskId);
+    if (!record) return;
+    await this.hub.reportTaskEvent({
+      taskId,
+      contextId: record.contextId,
+      kind: "a2a.status-update",
+      data: statusUpdateEventJson(taskId, record.contextId, state),
+      timestampUtc: new Date().toISOString(),
+    });
+  }
+
+  private async acquireSessionHandle(dshSessionId: string): Promise<AgentHandle> {
+    const existing = this.handles.get(dshSessionId);
+    if (existing) return existing;
+    // Recreate on the CONFIRMED canonical session id (continuation of the
+    // persisted conversation log); never on an A2A-derived value.
+    const handle = await this.ctx.agents.create({ sessionId: SessionId(dshSessionId) });
+    this.handles.set(dshSessionId, handle);
     return handle;
   }
 
   /** Report one task event with the record's A2A contextId echoed. */
   private async report(taskId: string, event: Omit<ClusterTaskEvent, "taskId" | "contextId" | "timestampUtc"> & { data?: Record<string, unknown> }): Promise<boolean> {
-    return this.reportWith(taskId, this.registry.get(taskId)?.contextId, event);
+    return this.reportWith(taskId, this.registry.knownContextOf(taskId), event);
   }
 
   private async reportWith(taskId: string, contextId: string | undefined, event: Omit<ClusterTaskEvent, "taskId" | "contextId" | "timestampUtc"> & { data?: Record<string, unknown> }): Promise<boolean> {
@@ -187,98 +493,47 @@ export class TaskIntake {
     });
   }
 
-  /**
-   * Serialize turns per conversation: concurrent dispatches into one context
-   * run their followups strictly in order instead of interleaving on the
-   * shared agent/session.
-   */
-  private readonly sessionQueues = new Map<string, Promise<void>>();
-
-  private enqueueRun(sessionKey: string, taskId: string, source: TaskSource, prompt: string, cwd: string, workspace: Awaited<ReturnType<typeof resolveWorkspace>>): void {
-    const prev = this.sessionQueues.get(sessionKey) ?? Promise.resolve();
-    const next = prev.then(() => this.runTask(sessionKey, taskId, source, prompt, cwd, workspace));
-    this.sessionQueues.set(sessionKey, next);
-    void next.finally(() => {
-      if (this.sessionQueues.get(sessionKey) === next) this.sessionQueues.delete(sessionKey);
-    });
-  }
-
-  private async runTask(sessionKey: string, taskId: string, source: TaskSource, prompt: string, cwd: string, workspace: Awaited<ReturnType<typeof resolveWorkspace>>): Promise<void> {
-    let handle: AgentHandle;
-    try {
-      handle = await this.acquireSessionHandle(taskId, sessionKey, cwd, workspace);
-    } catch (error) {
-      this.registry.finish(taskId, "error");
-      this.registry.archive(taskId, "error", source);
-      this.registry.delete(taskId);
-      this.counters.failedTasks++;
-      const detail = errorMessage(error).slice(0, 300);
-      this.log.error("intake", `agent create failed for ${taskId}: ${detail}`, taskId);
-      await this.report(taskId, { kind: TASK_EVENT_KINDS.FAILED, message: `agent create failed: ${detail}` });
-      return;
-    }
-    await this.runTurn(sessionKey, taskId, handle, prompt);
-  }
-
-  private async runTurn(sessionKey: string, taskId: string, handle: AgentHandle, prompt: string): Promise<void> {
-    const { agent } = handle;
-    try {
-      await agent.whenIdle();
-      const firstSeq = agent.session.seq;
-      this.relay.attach(taskId, sessionKey);
-      agent.followup(createUserMessage({ content: [{ type: "text", text: prompt }], source: { kind: "user" } }));
-      await agent.whenIdle();
-      await this.ctx.sessions.flush(agent.session);
-
-      const outcome = summarizeOutcome(agent.session.events, firstSeq);
-      this.relay.detach(taskId);
-      const source = this.registry.get(taskId)?.source ?? "taskDispatched";
-      if (outcome.finishReason === "completed") {
-        this.registry.finish(taskId, "completed");
-        this.registry.archive(taskId, "completed", source, outcome.text);
-        this.counters.processedTasks++;
-        this.log.info("intake", `task ${taskId} completed`, taskId);
-        await this.report(taskId, {
-          kind: TASK_EVENT_KINDS.COMPLETED,
-          message: "task completed",
-          data: { finalResponse: outcome.text, finishReason: "completed" },
-        });
-      } else {
-        this.registry.finish(taskId, outcome.finishReason);
-        this.registry.archive(taskId, outcome.finishReason, source, outcome.text);
-        this.counters.failedTasks++;
-        this.log.warn("intake", `task ${taskId} finished with reason=${outcome.finishReason}`, taskId);
-        await this.report(taskId, {
-          kind: TASK_EVENT_KINDS.FAILED,
-          data: { finishReason: outcome.finishReason, errorCode: outcome.errorCode ?? null, errorMessage: outcome.errorMessage?.slice(0, 300) ?? null },
-        });
-      }
-    } catch (error) {
-      this.relay.detach(taskId);
-      this.registry.finish(taskId, "error");
-      this.registry.archive(taskId, "error", this.registry.get(taskId)?.source ?? "taskDispatched");
-      this.counters.failedTasks++;
-      const detail = errorMessage(error).slice(0, 300);
-      this.log.error("intake", `task ${taskId} crashed: ${detail}`, taskId);
-      await this.report(taskId, { kind: TASK_EVENT_KINDS.FAILED, message: `execution error: ${detail}` });
-    } finally {
-      // Deliberately NOT handle.dispose(): dispose would remove the session
-      // from the store and the sidebar conversation vanishes. The agent stays
-      // idle and its session stays live so the user can open it and read the
-      // result; idle agents are capped by enforceIdleCap().
-      this.registry.delete(taskId);
-      void this.enforceIdleCap();
-    }
-  }
-
-  /** Dispose oldest idle agents beyond the cap (their sessions age out). */
+  /** Dispose idle conversation handles beyond the cap, oldest first. */
   private async enforceIdleCap(): Promise<void> {
     try {
       const keep = Math.max(this.config.maxConcurrency * 3, 6);
-      const disposed = await this.registry.disposeIdleBeyond(keep);
-      for (const taskId of disposed) this.log.info("intake", `disposed idle agent/session ${taskId} (cap ${keep})`);
+      const busy = new Set<string>();
+      for (const context of this.contexts.list()) {
+        if (context.activeTaskId || context.queuedTaskIds.length > 0) busy.add(context.dshSessionId);
+      }
+      const disposed: string[] = [];
+      for (const [dshSessionId, handle] of [...this.handles]) {
+        if (busy.has(dshSessionId)) continue;
+        if (this.handles.size - disposed.length <= keep) break;
+        try {
+          await handle.dispose();
+        } catch {
+          /* ignore */
+        }
+        this.handles.delete(dshSessionId);
+        disposed.push(dshSessionId);
+      }
+      for (const dshSessionId of disposed) this.log.info("intake", `disposed idle conversation session ${dshSessionId} (cap ${keep})`);
     } catch (error) {
       this.log.warn("intake", `idle-cap enforcement failed: ${errorMessage(error)}`);
+    }
+  }
+
+  /** Stop and dispose every live conversation handle (plugin unload). */
+  async disposeAll(): Promise<void> {
+    const handles = [...this.handles.values()];
+    this.handles.clear();
+    for (const handle of handles) {
+      try {
+        handle.agent.cancel({ kind: "disposed" });
+      } catch {
+        /* ignore */
+      }
+      try {
+        await handle.dispose();
+      } catch {
+        /* ignore */
+      }
     }
   }
 }

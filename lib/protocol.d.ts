@@ -136,6 +136,8 @@ export interface ClusterStatusView {
 }
 export interface ActiveTaskView {
     taskId: string;
+    contextId: string;
+    /** A2A task state (submitted/working/input-required/...). */
     status: string;
     source: string;
     startedAt: number;
@@ -144,6 +146,7 @@ export interface ActiveTaskView {
 }
 export interface RecentTaskView {
     taskId: string;
+    contextId: string;
     source: string;
     finishReason: string;
     startedAt: number;

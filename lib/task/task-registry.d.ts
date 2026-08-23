@@ -1,82 +1,80 @@
-/**
- * Task registry: task-session mapping (sessionId == taskId), status, per-task
- * forward seq, and live AgentHandle ownership for teardown.
- */
-import type { AgentHandle } from "@deepseek-ai/dsh-agent";
-import type { FinishReason } from "../protocol.js";
-export type TaskStatus = "starting" | "running" | "completed" | "failed";
+/** A2A v1 task states (spec §4.1.3 vocabulary used by the mapping doc). */
+export declare const TASK_STATES: readonly ["submitted", "working", "completed", "failed", "canceled", "input-required", "rejected", "auth-required"];
+export type TaskState = (typeof TASK_STATES)[number];
+export declare function isTerminalState(state: TaskState): boolean;
 export type TaskSource = "taskDispatched" | "a2a";
+/** Result reference recorded when a task reaches a terminal state. */
+export interface TaskResult {
+    finishReason: string;
+    finalResponse?: string;
+    errorCode?: string;
+    errorMessage?: string;
+}
 export interface TaskRecord {
     taskId: string;
-    status: TaskStatus;
-    source: TaskSource;
-    /** A2A conversation context (= session key); echoed in every reported task event. */
+    /** Required reference key into the context registry. */
     contextId: string;
-    startedAt: number;
-    finishedAt?: number;
+    source: TaskSource;
+    state: TaskState;
+    createdAt: number;
+    updatedAt: number;
     lastEventType?: string;
     lastEventAt?: number;
-    finishReason?: FinishReason;
-    /** Last assigned per-task forward seq. */
+    result?: TaskResult;
+    /** Last assigned per-task forward seq (progress event ordering). */
     seq: number;
 }
-/** Bounded terminal history entry — survives registry deletion so the panel
- * can show recently finished tasks without catching them mid-run. */
+/** Bounded terminal history entry for the cluster panel. */
 export interface TaskHistoryEntry {
     taskId: string;
+    contextId: string;
     source: TaskSource;
-    finishReason: FinishReason;
+    state: TaskState;
     startedAt: number;
     finishedAt: number;
     durationMs: number;
     lastEventType?: string;
-    /** Final assistant response text (from the turn/end outcome). */
     finalResponse?: string;
 }
 export declare class TaskRegistry {
     private readonly historyCapacity;
     private readonly contextMemoryCapacity;
     private tasks;
-    /** Live agent handles keyed by session key (= A2A contextId). */
-    private handles;
-    /** taskId → contextId for every accepted task (survives deletion; bounded). */
-    private contexts;
     private readonly history;
+    /**
+     * taskId -> contextId for every accepted task, surviving deletion so a
+     * later message can infer the context of a finished task (bounded).
+     */
+    private contexts;
     constructor(historyCapacity?: number, contextMemoryCapacity?: number);
-    begin(taskId: string, source: TaskSource, contextId: string): TaskRecord;
-    /** Last known contextId of a task — including finished/deleted ones (bounded memory). */
-    knownContextOf(taskId: string): string | undefined;
+    /** Create a task record in the initial `submitted` state. */
+    begin(taskId: string, contextId: string, source: TaskSource): TaskRecord;
     get(taskId: string): TaskRecord | undefined;
     has(taskId: string): boolean;
-    attachHandle(taskId: string, handle: AgentHandle): void;
-    getHandleBySession(sessionKey: string): AgentHandle | undefined;
-    getHandle(taskId: string): AgentHandle | undefined;
-    setRunning(taskId: string): void;
+    /** Last known contextId of a task — including terminal/deleted ones (bounded memory). */
+    knownContextOf(taskId: string): string | undefined;
+    /**
+     * Advance a task's state exactly once along legal edges. Terminal states are
+     * immutable; only `input-required` may return to `working` (via a follow-up
+     * message on the same taskId).
+     */
+    transition(taskId: string, to: TaskState): TaskRecord | undefined;
+    /** Attach the terminal result reference; the caller performs the state transition first. */
+    setResult(taskId: string, result: TaskResult): void;
     touch(taskId: string, eventType: string): void;
     nextSeq(taskId: string): number;
-    finish(taskId: string, finishReason: FinishReason): TaskRecord | undefined;
-    /** Tasks still occupying a concurrency slot. */
+    /** Tasks still occupying a concurrency slot (non-terminal states). */
     activeCount(): number;
     list(): TaskRecord[];
     listActive(): TaskRecord[];
     /**
-     * Remove the task record only. The AgentHandle is intentionally KEPT: the
-     * agent's session must stay live after completion so the web-ui sidebar
-     * keeps the conversation and the user can open it to read the result.
-     * Idle handles are capped by {@link disposeIdleBeyond}.
+     * Remove the live task record only. The conversation (context) and its
+     * session stay untouched; the bounded context map keeps taskId -> contextId
+     * so later messages can still resolve the finished task's context.
      */
     delete(taskId: string): void;
     /** Recent finished tasks, newest first (bounded). */
     recent(): TaskHistoryEntry[];
     /** Record a terminal outcome into the bounded history. */
-    archive(taskId: string, finishReason: FinishReason, source: TaskSource, finalResponse?: string): void;
-    /**
-     * Dispose idle agent handles beyond `keep`, oldest first (handles whose
-     * context has no active task = completed). Disposing removes their sessions
-     * from the live store, so old task conversations age out of the sidebar in
-     * bounded numbers. Returns the disposed session keys.
-     */
-    disposeIdleBeyond(keep: number): Promise<string[]>;
-    /** Stop and dispose every live handle (plugin unload). */
-    disposeAll(): Promise<void>;
+    archive(taskId: string, state: TaskState, finalResponse?: string): void;
 }

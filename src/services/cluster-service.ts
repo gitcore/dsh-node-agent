@@ -58,10 +58,11 @@ export class ClusterService extends TypertRemoteService {
     const now = Date.now();
     return registry.listActive().map((record) => ({
       taskId: record.taskId,
-      status: record.status,
+      contextId: record.contextId,
+      status: record.state,
       source: record.source,
-      startedAt: record.startedAt,
-      elapsedMs: now - record.startedAt,
+      startedAt: record.createdAt,
+      elapsedMs: now - record.createdAt,
       lastEventType: record.lastEventType,
     }));
   }
@@ -70,8 +71,9 @@ export class ClusterService extends TypertRemoteService {
   getRecentTasks(): RecentTaskView[] {
     return this.deps.registry.recent().map((entry) => ({
       taskId: entry.taskId,
+      contextId: entry.contextId,
       source: entry.source,
-      finishReason: entry.finishReason,
+      finishReason: entry.state === "completed" ? "completed" : entry.state === "failed" ? "error" : entry.state === "input-required" ? "blocked" : "aborted",
       startedAt: entry.startedAt,
       finishedAt: entry.finishedAt,
       durationMs: entry.durationMs,

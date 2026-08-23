@@ -1,7 +1,8 @@
 import type { Context } from "@deepseek-ai/cordis";
 import { type ClusterA2AMessageEnvelope, type ClusterTaskDispatch, type PluginConfig } from "../protocol.js";
 import { type HubConnectionManager } from "../connection/hub-connection.js";
-import type { TaskRegistry } from "./task-registry.js";
+import { ContextRegistry } from "./context-registry.js";
+import { type TaskRegistry } from "./task-registry.js";
 import type { EventRelay } from "../events/event-relay.js";
 import type { Logger } from "../services/log-buffer.js";
 export interface IntakeCounters {
@@ -12,33 +13,41 @@ export declare class TaskIntake {
     private readonly ctx;
     private readonly config;
     private readonly registry;
+    private readonly contexts;
     private readonly hub;
     private readonly relay;
     private readonly log;
     private readonly counters;
     private readonly selection;
-    constructor(ctx: Context, config: PluginConfig, registry: TaskRegistry, hub: HubConnectionManager, relay: EventRelay, log: Logger, counters: IntakeCounters);
+    /** Live agent handles keyed by the confirmed canonical dshSessionId. */
+    private readonly handles;
+    /** Per-context turn FIFO: prompts into one conversation never interleave. */
+    private readonly sessionQueues;
+    /** Next prompt per queued task (the context FIFO only carries task ids). */
+    private readonly pendingTurns;
+    constructor(ctx: Context, config: PluginConfig, registry: TaskRegistry, contexts: ContextRegistry, hub: HubConnectionManager, relay: EventRelay, log: Logger, counters: IntakeCounters);
     onTaskDispatched(payload: ClusterTaskDispatch): void;
     onA2AMessage(envelope: ClusterA2AMessageEnvelope): void;
     private accept;
-    /**
-     * Acquire the live handle for a conversation session. Must run inside the
-     * per-conversation queue: two dispatches racing into one otherwise-fresh
-     * context would both see no handle and create the same session twice.
-     */
+    /** First contact (or a context-less dispatch): create context + task. */
+    private startNewContextTask;
+    /** Shared tail: register the task record, announce it, and queue its turn. */
+    private beginAndQueue;
+    /** Workspace / private-session binding checks against an existing context. */
+    private checkBindingConflicts;
+    /** Start the next queued turn unless a task is still active in the context. */
+    private pump;
+    private enqueueRun;
+    private executeTurn;
+    private settle;
+    /** Announce an A2A state transition as an official TaskStatusUpdateEvent. */
+    private emitStatus;
     private acquireSessionHandle;
     /** Report one task event with the record's A2A contextId echoed. */
     private report;
     private reportWith;
-    /**
-     * Serialize turns per conversation: concurrent dispatches into one context
-     * run their followups strictly in order instead of interleaving on the
-     * shared agent/session.
-     */
-    private readonly sessionQueues;
-    private enqueueRun;
-    private runTask;
-    private runTurn;
-    /** Dispose oldest idle agents beyond the cap (their sessions age out). */
+    /** Dispose idle conversation handles beyond the cap, oldest first. */
     private enforceIdleCap;
+    /** Stop and dispose every live conversation handle (plugin unload). */
+    disposeAll(): Promise<void>;
 }

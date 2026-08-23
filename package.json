@@ -34,6 +34,7 @@
     "build": "npm run build:host && npm run build:client",
     "build:host": "tsc -p tsconfig.json",
     "build:client": "node build-client.mjs",
+    "test": "node --test \"tests/*.test.mjs\"",
     "clean": "rm -rf lib"
   },
   "dependencies": {

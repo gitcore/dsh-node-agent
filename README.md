@@ -85,16 +85,16 @@ Docker 一键方案见仓库根 `Dockerfile`。
 
 按 ClusterLink 契约（§8），可用 `SUNSET_WORKSPACE_ROOTS`（`:` 分隔）或配置文件 `workspaceRoots` 限制路径提示只允许落在指定根目录内；未配置时不限制。
 
-## 会话上下文与续聊（A2A v1 §3.4 语义）
+## 会话上下文与续聊（A2A v1 §3.4 + server-owned context 策略）
 
-- **`contextId` 标识会话（对话），`taskId` 只标识会话内的单个任务单元。**
-- DSH 会话绑定在 `contextId` 上：同一 context 的所有任务共享同一个会话，对话历史自然延续（Context Inheritance）。
-- **首条消息**省略 `contextId` 时由节点生成 UUID，并随后续所有 `reportTaskEvent`（started/progress/completed/failed）回传——调度方从任意事件取值。
-- **同一对话开新任务**：新 `taskId` + 相同 `contextId` → 加入既有会话。
-- **继续既有任务**：相同 `taskId` 再次下发（可带相同 `contextId`）→ contextId 从任务历史推断；不带 contextId 同样生效。
-- **mismatch 拒绝**：`taskId` 已知但其记录的 context 与传入 `contextId` 不一致时，任务被拒绝（FAILED: contextId does not match the referenced task）。
-- 同一会话内的并发下发按到达顺序串行执行（不交叉）；活跃任务重复下发相同 `taskId` 仍会被拒绝（duplicate taskId）。
-- 会话 cwd 由该对话的第一个任务决定；后续任务的 workspace 提示不改变已存在会话的 cwd。超过空闲上限（`maxConcurrency × 3`）的会话会被回收，之后同 context 下发将开启新会话。
+- **`contextId` 标识对话，`taskId` 只标识对话内的一个任务记录**；DSH 会话由 context registry 内部的 opaque `dshSessionId` 标识（由 DSH 协议创建/确认返回，绝不从 taskId/contextId 派生）。
+- **首条消息**（无 `contextId`/`taskId`）：节点生成两者并回传；同一对话的所有任务共享同一个 DSH 会话与历史。
+- **同一对话开新任务**：已知 `contextId`、无 `taskId` → 新建服务端生成的 taskId，复用该 context 的 DSH 会话。
+- **继续既有任务**：带已知 `taskId`（`contextId` 可选）→ 继续该 task 所属 context 的 DSH 会话；终态任务的引用会开启同对话的新任务（旧任务记录不可变）。
+- **强制拒绝（零副作用）**：未知 `taskId`（task not found）、未知 `contextId`（server-owned policy，不生成替代值）、`taskId` 与 `contextId` 不匹配、同 context 换 workspace、私有 `sessionId` 与 context 会话不一致（DshSessionMismatch）。
+- **串行**：同一 context 的 prompt 执行严格串行（submitted FIFO → working → 终态）；`input-required` 保持占用队列，只有相同 `taskId` 的后续消息可继续它。
+- 所有状态转换通过 `reportTaskEvent(kind=a2a.status-update)` 携带官方 A2A `TaskStatusUpdateEvent`（官方 SDK 序列化），同时保留 started/completed/failed 调度约定事件；两种事件都回传 `taskId` + `contextId`。
+- 进程重启不恢复内存映射：重启后旧 ID 一律按未知明确拒绝，不会为旧任务静默开新会话。
 
 ## 卸载清理
 

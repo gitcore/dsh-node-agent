@@ -11,6 +11,7 @@ import { loadConfig, type ClusterA2AMessageEnvelope, type ClusterTaskDispatch, t
 import { LogBuffer, createLogger } from "./services/log-buffer.js";
 import { errorMessage, HubConnectionManager, type HubCallbacks } from "./connection/hub-connection.js";
 import { ReconnectPolicy } from "./connection/reconnect-policy.js";
+import { ContextRegistry } from "./task/context-registry.js";
 import { TaskRegistry } from "./task/task-registry.js";
 import { TaskIntake, type IntakeCounters } from "./task/task-intake.js";
 import { EventRelay } from "./events/event-relay.js";
@@ -27,9 +28,10 @@ export function apply(ctx: Context): void {
   const logBuffer = new LogBuffer(config.logBufferSize);
   const log = createLogger(ctx, logBuffer, config.nodeId);
   const registry = new TaskRegistry();
+  const contexts = new ContextRegistry(log);
   const counters: IntakeCounters = { processedTasks: 0, failedTasks: 0 };
   const eventBuffer = new EventBuffer(config.eventBufferSize);
-  eventBuffer.setContextResolver((taskId) => registry.get(taskId)?.contextId);
+  eventBuffer.setContextResolver((taskId) => registry.get(taskId)?.contextId ?? registry.knownContextOf(taskId));
 
   let intake: TaskIntake;
 
@@ -53,8 +55,8 @@ export function apply(ctx: Context): void {
   };
 
   const hub = new HubConnectionManager(config, callbacks, log, new ReconnectPolicy());
-  const relay = new EventRelay(ctx, registry, eventBuffer, log);
-  intake = new TaskIntake(ctx, config, registry, hub, relay, log, counters);
+  const relay = new EventRelay(ctx, contexts, registry, eventBuffer, log);
+  intake = new TaskIntake(ctx, config, registry, contexts, hub, relay, log, counters);
 
   // Batching window: drain the relay queue on a fixed cadence; also the
   // offline-buffer retry loop when the hub is down.
@@ -71,7 +73,7 @@ export function apply(ctx: Context): void {
   ctx.effect(() => () => {
     log.info("connection", "plugin unloading: stopping connection and tasks");
     void hub.stop();
-    void registry.disposeAll();
+    void intake.disposeAll();
     relay.clear();
     eventBuffer.clear();
   });
