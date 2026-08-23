@@ -21,6 +21,12 @@ export declare class TaskIntake {
     onTaskDispatched(payload: ClusterTaskDispatch): void;
     onA2AMessage(envelope: ClusterA2AMessageEnvelope): void;
     private accept;
+    /**
+     * Acquire the live handle for a conversation session. Must run inside the
+     * per-conversation queue: two dispatches racing into one otherwise-fresh
+     * context would both see no handle and create the same session twice.
+     */
+    private acquireSessionHandle;
     /** Report one task event with the record's A2A contextId echoed. */
     private report;
     private reportWith;
@@ -31,6 +37,7 @@ export declare class TaskIntake {
      */
     private readonly sessionQueues;
     private enqueueRun;
+    private runTask;
     private runTurn;
     /** Dispose oldest idle agents beyond the cap (their sessions age out). */
     private enforceIdleCap;

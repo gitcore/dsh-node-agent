@@ -98,12 +98,12 @@ export class TaskIntake {
   private async accept(taskId: string, prompt: string, metadata: Record<string, unknown> | null | undefined, source: TaskSource, contextId?: string, workspaceHint?: unknown): Promise<void> {
     if (this.registry.has(taskId)) {
       this.log.warn("intake", `duplicate taskId ${taskId}; rejecting`, taskId);
-      await this.report(taskId, { kind: TASK_EVENT_KINDS.FAILED, message: "duplicate taskId" });
+      await this.reportWith(taskId, this.registry.knownContextOf(taskId), { kind: TASK_EVENT_KINDS.FAILED, message: "duplicate taskId" });
       return;
     }
     if (this.registry.activeCount() >= this.config.maxConcurrency) {
       this.log.warn("intake", `max concurrency (${this.config.maxConcurrency}) reached; rejecting ${taskId}`, taskId);
-      await this.report(taskId, { kind: TASK_EVENT_KINDS.FAILED, message: `max concurrency reached (${this.config.maxConcurrency})` });
+      await this.reportWith(taskId, this.registry.knownContextOf(taskId), { kind: TASK_EVENT_KINDS.FAILED, message: `max concurrency reached (${this.config.maxConcurrency})` });
       return;
     }
 
@@ -127,50 +127,50 @@ export class TaskIntake {
     const workspace = await resolveWorkspace(this.ctx, this.config, workspaceHint, this.log);
     const cwd = workspace?.path ?? this.config.workspace;
     if (workspace) this.log.info("intake", `task ${taskId} -> workspace ${workspace.path}`, taskId);
-    try {
-      // The DSH session is bound to the conversation (contextId), so every
-      // task in the same context shares one session and its history carries
-      // over (A2A Context Inheritance). Only an unknown context creates a new
-      // session.
-      const existingHandle = this.registry.getHandleBySession(resolvedContextId);
-      const handle = existingHandle ?? await this.ctx.agents.create({
-        sessionId: SessionId(resolvedContextId),
-        meta: { cwd },
-        agentOptions: this.selection ? { provider: this.selection.provider, model: this.selection.model } : undefined,
-        setup: (agentCtx) => {
-          if (this.selection) installModelSelection(agentCtx, { current: this.selection, assembled: void 0 });
-        },
-      });
-      if (existingHandle) this.log.info("intake", `task ${taskId} joins existing conversation ${resolvedContextId}`, taskId);
-      this.registry.attachHandle(taskId, handle);
-      // Attach the session to the workspace account (the other half of
-      // membership) so the sidebar groups it under that workspace. The first
-      // task of a conversation fixes the session cwd; later tasks in the same
-      // conversation keep it.
-      if (workspace && !existingHandle) {
-        try {
-          await workspace.attach(handle.agent.session.id);
-        } catch (error) {
-          this.log.warn("intake", `workspace attach failed for ${taskId}: ${errorMessage(error)}`, taskId);
-        }
-      }
-      this.registry.setRunning(taskId);
-      const accepted = await this.report(taskId, {
-        kind: TASK_EVENT_KINDS.STARTED,
-        message: "node accepted the task",
-        data: { sessionId: handle.agent.session.id, source, ...(workspace ? { workspace: workspace.path } : {}) },
-      });
-      if (!accepted) this.log.warn("intake", `started event not delivered (hub offline); session is running`, taskId);
-      void this.enqueueRun(resolvedContextId, taskId, handle, prompt);
-    } catch (error) {
-      this.registry.finish(taskId, "error");
-      this.registry.archive(taskId, "error", source);
-      this.registry.delete(taskId);
-      this.counters.failedTasks++;
-      const detail = errorMessage(error).slice(0, 300);
-      this.log.error("intake", `agent create failed for ${taskId}: ${detail}`, taskId);
-      await this.report(taskId, { kind: TASK_EVENT_KINDS.FAILED, message: `agent create failed: ${detail}` });
+    this.registry.setRunning(taskId);
+    // The DSH session is bound to the conversation (contextId); report the
+    // session identity immediately, then acquire the handle inside the
+    // per-conversation queue so concurrent dispatches into one context can
+    // never create the same session twice.
+    const accepted = await this.report(taskId, {
+      kind: TASK_EVENT_KINDS.STARTED,
+      message: "node accepted the task",
+      data: { sessionId: resolvedContextId, source, ...(workspace ? { workspace: workspace.path } : {}) },
+    });
+    if (!accepted) this.log.warn("intake", `started event not delivered (hub offline); task queued`, taskId);
+    void this.enqueueRun(resolvedContextId, taskId, source, prompt, cwd, workspace);
+  }
+
+  /**
+   * Acquire the live handle for a conversation session. Must run inside the
+   * per-conversation queue: two dispatches racing into one otherwise-fresh
+   * context would both see no handle and create the same session twice.
+   */
+  private async acquireSessionHandle(taskId: string, sessionKey: string, cwd: string, workspace: Awaited<ReturnType<typeof resolveWorkspace>>): Promise<AgentHandle> {
+    const existing = this.registry.getHandleBySession(sessionKey);
+    if (existing) {
+      this.log.info("intake", `task ${taskId} joins existing conversation ${sessionKey}`, taskId);
+      return existing;
     }
+    const handle = await this.ctx.agents.create({
+      sessionId: SessionId(sessionKey),
+      meta: { cwd },
+      agentOptions: this.selection ? { provider: this.selection.provider, model: this.selection.model } : undefined,
+      setup: (agentCtx) => {
+        if (this.selection) installModelSelection(agentCtx, { current: this.selection, assembled: void 0 });
+      },
+    });
+    this.registry.attachHandle(taskId, handle);
+    // Attach the session to the workspace account (the other half of
+    // membership) so the sidebar groups it under that workspace.
+    if (workspace) {
+      try {
+        await workspace.attach(handle.agent.session.id);
+      } catch (error) {
+        this.log.warn("intake", `workspace attach failed for ${taskId}: ${errorMessage(error)}`, taskId);
+      }
+    }
+    return handle;
   }
 
   /** Report one task event with the record's A2A contextId echoed. */
@@ -194,13 +194,30 @@ export class TaskIntake {
    */
   private readonly sessionQueues = new Map<string, Promise<void>>();
 
-  private enqueueRun(sessionKey: string, taskId: string, handle: AgentHandle, prompt: string): void {
+  private enqueueRun(sessionKey: string, taskId: string, source: TaskSource, prompt: string, cwd: string, workspace: Awaited<ReturnType<typeof resolveWorkspace>>): void {
     const prev = this.sessionQueues.get(sessionKey) ?? Promise.resolve();
-    const next = prev.then(() => this.runTurn(sessionKey, taskId, handle, prompt));
+    const next = prev.then(() => this.runTask(sessionKey, taskId, source, prompt, cwd, workspace));
     this.sessionQueues.set(sessionKey, next);
     void next.finally(() => {
       if (this.sessionQueues.get(sessionKey) === next) this.sessionQueues.delete(sessionKey);
     });
+  }
+
+  private async runTask(sessionKey: string, taskId: string, source: TaskSource, prompt: string, cwd: string, workspace: Awaited<ReturnType<typeof resolveWorkspace>>): Promise<void> {
+    let handle: AgentHandle;
+    try {
+      handle = await this.acquireSessionHandle(taskId, sessionKey, cwd, workspace);
+    } catch (error) {
+      this.registry.finish(taskId, "error");
+      this.registry.archive(taskId, "error", source);
+      this.registry.delete(taskId);
+      this.counters.failedTasks++;
+      const detail = errorMessage(error).slice(0, 300);
+      this.log.error("intake", `agent create failed for ${taskId}: ${detail}`, taskId);
+      await this.report(taskId, { kind: TASK_EVENT_KINDS.FAILED, message: `agent create failed: ${detail}` });
+      return;
+    }
+    await this.runTurn(sessionKey, taskId, handle, prompt);
   }
 
   private async runTurn(sessionKey: string, taskId: string, handle: AgentHandle, prompt: string): Promise<void> {
