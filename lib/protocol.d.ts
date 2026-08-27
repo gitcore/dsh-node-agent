@@ -73,7 +73,7 @@ export interface RelayEvent {
  */
 export declare const EVENT_WHITELIST: Set<string>;
 export declare const DEFAULT_HUB_URL = "http://localhost:5080/cluster-link/hub";
-export declare const DEFAULT_DSH_VERSION = "0.1.0-rc.8";
+export declare const DEFAULT_DSH_VERSION = "unknown";
 /**
  * Fallback config file location when the process env carries no SUNSET_*
  * values (e.g. an externally managed production instance whose env cannot be
