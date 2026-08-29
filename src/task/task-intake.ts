@@ -44,7 +44,7 @@ function contextIdOf(value: unknown): string | undefined {
 }
 
 /** Official A2A TaskStatusUpdateEvent wire JSON built through the official SDK serializer. */
-function statusUpdateEventJson(taskId: string, contextId: string, state: TaskState): Record<string, unknown> {
+function statusUpdateEventJson(taskId: string, contextId: string, state: TaskState, messageText?: string): Record<string, unknown> {
   const a2aState = {
     submitted: A2aTaskState.TASK_STATE_SUBMITTED,
     working: A2aTaskState.TASK_STATE_WORKING,
@@ -55,7 +55,21 @@ function statusUpdateEventJson(taskId: string, contextId: string, state: TaskSta
     "input-required": A2aTaskState.TASK_STATE_INPUT_REQUIRED,
     "auth-required": A2aTaskState.TASK_STATE_AUTH_REQUIRED,
   }[state];
-  return TaskStatusUpdateEvent.toJSON(TaskStatusUpdateEvent.fromJSON({ taskId, contextId, status: { state: a2aState } })) as Record<string, unknown>;
+  // Terminal/blocking states carry the surfaced text in status.message so the
+  // server can persist an Agent reply (completed) or a failure reason (failed /
+  // input-required). Per A2A, a message requires an id: the server no longer
+  // fabricates one, so a status.message without messageId is rejected. The id
+  // is unique per emission (taskId:state:uuid), never derived from DSH private
+  // session ids. Non-terminal states (working/submitted) carry no message.
+  const status: { state: number; message?: { role: string; messageId: string; parts: Array<{ text: string }> } } = { state: a2aState };
+  if (messageText) {
+    status.message = {
+      role: "ROLE_AGENT",
+      messageId: `${taskId}:${state}:${randomUUID()}`,
+      parts: [{ text: messageText }],
+    };
+  }
+  return TaskStatusUpdateEvent.toJSON(TaskStatusUpdateEvent.fromJSON({ taskId, contextId, status })) as Record<string, unknown>;
 }
 
 export class TaskIntake {
@@ -428,7 +442,7 @@ export class TaskIntake {
       if (outcome.finishReason === "blocked") {
         // input-required holds the queue: the same taskId must be continued.
         this.registry.transition(taskId, "input-required");
-        await this.emitStatus(taskId, "input-required");
+        await this.emitStatus(taskId, "input-required", "waiting for input");
         await this.report(taskId, { kind: TASK_EVENT_KINDS.PROGRESS, message: "waiting for input", data: { state: "input-required" } });
         this.log.info("intake", `task ${taskId} waits for input; queue held`, taskId);
         return;
@@ -467,29 +481,30 @@ export class TaskIntake {
     this.registry.archive(taskId, state, finalResponse);
     if (state === "completed") this.counters.processedTasks++;
     else this.counters.failedTasks++;
-    void this.emitStatus(taskId, state);
     if (state === "completed") {
+      // Reply text rides in the official A2A status.message so the server can
+      // persist an Agent chat reply from the channel it consumes. The legacy
+      // started/completed/failed scheduling events are deprecated for new nodes.
       const text = finalResponse ?? "";
+      void this.emitStatus(taskId, state, text);
       this.log.info("intake", `task ${taskId} completed`, taskId);
-      void this.report(taskId, { kind: TASK_EVENT_KINDS.COMPLETED, message: "task completed", data: { finalResponse: text, finishReason: "completed" } });
     } else {
+      // Terminal failure also carries a status.message per the A2A contract.
+      const failureText = errorMessageText?.trim() || `task ${taskId} failed`;
+      void this.emitStatus(taskId, state, failureText);
       this.log.warn("intake", `task ${taskId} finished with state=${state}`, taskId);
-      void this.report(taskId, {
-        kind: TASK_EVENT_KINDS.FAILED,
-        data: { state, errorCode: errorCode ?? null, errorMessage: errorMessageText?.slice(0, 300) ?? null },
-      });
     }
   }
 
   /** Announce an A2A state transition as an official TaskStatusUpdateEvent. */
-  private async emitStatus(taskId: string, state: TaskState): Promise<void> {
+  private async emitStatus(taskId: string, state: TaskState, messageText?: string): Promise<void> {
     const record = this.registry.get(taskId);
     if (!record) return;
     await this.hub.reportTaskEvent({
       taskId,
       contextId: record.contextId,
       kind: "a2a.status-update",
-      data: statusUpdateEventJson(taskId, record.contextId, state),
+      data: statusUpdateEventJson(taskId, record.contextId, state, messageText),
       timestampUtc: new Date().toISOString(),
     });
   }

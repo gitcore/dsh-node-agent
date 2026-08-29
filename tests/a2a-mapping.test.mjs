@@ -310,3 +310,46 @@ test("input-required holds the queue until the same taskId continues it", async 
     await rm(wsRoot, { recursive: true, force: true });
   }
 });
+
+test("a2a.status-update carries the surfaced text in status.message for terminal/blocking states", async () => {
+  // completed
+  const done = makeHarness();
+  done.intake.onA2AMessage(a2aEnvelope({ text: "hello" }));
+  await waitFor(() => done.counters.processedTasks === 1, "completed");
+  const completed = done.taskEvents.find((e) => e.kind === "a2a.status-update" && e.data?.status?.state === "TASK_STATE_COMPLETED");
+  assert.ok(completed, "completed a2a.status-update emitted");
+  assert.equal(completed.data.status.message.role, "ROLE_AGENT");
+  assert.ok(completed.data.status.message.messageId, "completed carries a non-empty messageId (server rejects a missing id)");
+  assert.match(completed.data.status.message.parts[0].text, /./, "completed carries a non-empty reply text");
+
+  // failed (turn ends with an error reason)
+  const failed = makeHarness({ reasonPlan: [["error", "completed"]] });
+  failed.intake.onA2AMessage(a2aEnvelope({ text: "boom" }));
+  await waitFor(() => failed.counters.failedTasks === 1, "failed");
+  const failedUpdate = failed.taskEvents.find((e) => e.kind === "a2a.status-update" && e.data?.status?.state === "TASK_STATE_FAILED");
+  assert.ok(failedUpdate, "failed a2a.status-update emitted");
+  assert.ok(failedUpdate.data.status.message.messageId, "failed carries a messageId");
+  assert.ok(failedUpdate.data.status.message.parts[0].text.length > 0, "failed carries a status.message text");
+
+  // input-required (blocked turn) carries a status.message
+  const blocked = makeHarness({
+    reasonPlan: [["blocked", "completed"]],
+    registryMock: {
+      get: () => undefined,
+      list: () => [],
+      resolveByPath: async () => undefined,
+      create: async (path) => ({ path, attachSession: async () => {} }),
+    },
+  });
+  blocked.intake.onA2AMessage(a2aEnvelope({ text: "need input" }));
+  await waitFor(() => blocked.registry.listActive().some((t) => t.state === "input-required"), "input-required");
+  const blockedUpdate = blocked.taskEvents.find((e) => e.kind === "a2a.status-update" && e.data?.status?.state === "TASK_STATE_INPUT_REQUIRED");
+  assert.ok(blockedUpdate, "input-required a2a.status-update emitted");
+  assert.ok(blockedUpdate.data.status.message.messageId, "input-required carries a messageId");
+  assert.ok(blockedUpdate.data.status.message.parts[0].text.length > 0, "input-required carries a status.message text");
+
+  // working carries NO status.message (and therefore no messageId)
+  const working = done.taskEvents.find((e) => e.kind === "a2a.status-update" && e.data?.status?.state === "TASK_STATE_WORKING");
+  assert.ok(working, "working a2a.status-update emitted");
+  assert.equal(working.data.status.message, undefined, "working carries no status.message");
+});
