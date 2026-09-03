@@ -1,4 +1,4 @@
-import type { ClusterA2AMessage, ClusterA2AMessageEnvelope, ClusterNodeSnapshot, ClusterTaskDispatch, ClusterTaskEvent, PluginConfig } from "../protocol.js";
+import type { ClusterLinkPayloadEnvelope, ClusterNodeSnapshot, PluginConfig } from "../protocol.js";
 import { ReconnectPolicy } from "./reconnect-policy.js";
 import type { Logger } from "../services/log-buffer.js";
 export type ConnectionState = "disconnected" | "connecting" | "connected" | "reconnecting" | "misconfigured";
@@ -6,9 +6,7 @@ export interface HubCallbacks {
     onStateChange(state: ConnectionState): void;
     /** Fired right after a successful (re-)registration — the drain hook for the event buffer. */
     onRegistered(): void;
-    onTaskDispatched(payload: ClusterTaskDispatch): void;
-    onA2AMessage(message: ClusterA2AMessageEnvelope): void;
-    onTaskEventReceived(event: ClusterTaskEvent): void;
+    onPayloadDispatched(payload: ClusterLinkPayloadEnvelope): void;
 }
 export interface HubEventMetrics {
     reportsSent: number;
@@ -47,9 +45,8 @@ export declare class HubConnectionManager {
     private register;
     private startHeartbeat;
     private heartbeat;
-    /** Report one task event; returns false when the hub is not ready (caller buffers). */
-    reportTaskEvent(event: ClusterTaskEvent): Promise<boolean>;
-    sendA2AMessage(message: ClusterA2AMessage): Promise<ClusterA2AMessageEnvelope | undefined>;
+    /** Report one v2 payload; returns false when the hub is not ready (caller buffers). */
+    reportPayload(payload: ClusterLinkPayloadEnvelope): Promise<boolean>;
     stop(): Promise<void>;
     private setState;
     private clearHeartbeat;

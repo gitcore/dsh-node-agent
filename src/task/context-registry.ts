@@ -1,26 +1,19 @@
 /**
- * Context registry: owns the contextId -> opaque dshSessionId association plus
- * the per-context FIFO queue and active task pointer (dsh-a2a-context-session-
- * mapping.md "Required registry shape").
- *
- * The dshSessionId is confirmed by the DSH protocol create/restore flow — it
- * is never derived from a taskId, contextId, or message id.
+ * Context registry owns the A2A contextId plus the per-context FIFO queue and
+ * active task pointer. Runtime SignalR/DSH handles are deliberately excluded:
+ * they are process-local transport resources and have no Chat conversation
+ * identity or persistence meaning.
  */
 import type { Logger } from "../services/log-buffer.js";
 
 export interface ContextRecord {
   /** Primary key: server-owned A2A conversation id. */
   contextId: string;
-  /**
-   * Opaque canonical session id confirmed by the DSH protocol. Empty string
-   * only while a brand-new context is being provisioned (pre-confirm).
-   */
-  dshSessionId: string;
   /** Resolved stable workspace value; immutable after creation. */
   workspace?: string;
   /** Raw workspace hint as first provided; immutable after creation (conflict detection). */
   workspaceHint?: string;
-  /** The task currently writing to the DSH session, if any. */
+  /** The task currently using this context's transient runtime agent, if any. */
   activeTaskId: string | null;
   /** FIFO of submitted taskIds waiting for the active task to reach a terminal state. */
   queuedTaskIds: string[];
@@ -28,7 +21,6 @@ export interface ContextRecord {
 
 export class ContextRegistry {
   private readonly contexts = new Map<string, ContextRecord>();
-  private readonly byDshSession = new Map<string, string>();
 
   constructor(private readonly log: Logger) {}
 
@@ -40,25 +32,18 @@ export class ContextRegistry {
     return this.contexts.get(contextId);
   }
 
-  /** Reverse lookup: which context owns this DSH session. */
-  contextIdByDshSession(dshSessionId: string): string | undefined {
-    return this.byDshSession.get(dshSessionId);
-  }
-
   /** All context records (insertion order). */
   list(): ContextRecord[] {
     return [...this.contexts.values()];
   }
 
   /**
-   * Provision a brand-new context record. The dshSessionId is empty until
-   * {@link confirmSession} records the DSH-confirmed canonical value.
+   * Provision a brand-new A2A context record.
    */
   create(contextId: string, workspace?: { resolved: string | undefined; hint: string | undefined }): ContextRecord {
     if (this.contexts.has(contextId)) throw new Error(`context ${contextId} already exists`);
     const record: ContextRecord = {
       contextId,
-      dshSessionId: "",
       activeTaskId: null,
       queuedTaskIds: [],
       ...(workspace?.resolved ? { workspace: workspace.resolved } : {}),
@@ -68,19 +53,35 @@ export class ContextRegistry {
     return record;
   }
 
-  /** Store the DSH-confirmed canonical session id and build the reverse index. */
-  confirmSession(contextId: string, dshSessionId: string): void {
-    const record = this.contexts.get(contextId);
-    if (!record) throw new Error(`context ${contextId} does not exist`);
-    if (record.dshSessionId && record.dshSessionId !== dshSessionId) throw new Error(`context ${contextId} already bound to another DSH session`);
-    record.dshSessionId = dshSessionId;
-    this.byDshSession.set(dshSessionId, contextId);
+  /** Recreate the persisted A2A context after a node restart. */
+  restore(
+    contextId: string,
+    workspace?: { resolved: string | undefined; hint: string | undefined },
+  ): ContextRecord {
+    const normalizedContextId = contextId.trim();
+    if (!normalizedContextId) throw new Error("contextId is required");
+
+    const existing = this.contexts.get(normalizedContextId);
+    if (existing) return existing;
+    const record: ContextRecord = {
+      contextId: normalizedContextId,
+      activeTaskId: null,
+      queuedTaskIds: [],
+      ...(workspace?.resolved ? { workspace: workspace.resolved } : {}),
+      ...(workspace?.hint ? { workspaceHint: workspace.hint } : {}),
+    };
+    this.contexts.set(normalizedContextId, record);
+    this.log.info("intake", `restored A2A context ${normalizedContextId}`);
+    return record;
   }
 
-  /** Remove a provisioned record that never got a confirmed session (creation failure rollback). */
-  deleteIfUnconfirmed(contextId: string): void {
+  /** Remove an unstarted context after runtime-handle creation failed. */
+  delete(contextId: string): void {
     const record = this.contexts.get(contextId);
-    if (!record || record.dshSessionId) return;
+    if (!record) return;
+    if (record.activeTaskId || record.queuedTaskIds.length > 0) {
+      throw new Error(`context ${contextId} cannot be removed while work is active`);
+    }
     this.contexts.delete(contextId);
   }
 

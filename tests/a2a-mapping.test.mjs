@@ -1,15 +1,4 @@
-/**
- * Deterministic fixtures for the frozen A2A context/session mapping
- * (dsh-a2a-context-session-mapping.md step 7). Runs against the compiled lib/
- * with mocked cordis/dsh boundaries — no real DSH runtime needed.
- *
- * Run: npm test   (node --test tests/)
- */
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import test from "node:test";
 
 import { ContextRegistry } from "../lib/task/context-registry.js";
@@ -18,338 +7,372 @@ import { TaskIntake } from "../lib/task/task-intake.js";
 import { TaskRegistry } from "../lib/task/task-registry.js";
 import { EventBuffer } from "../lib/events/event-buffer.js";
 
-const quietLog = { info() {}, warn() {}, error() {}, debug() {} };
+const log = { info() {}, warn() {}, error() {}, debug() {} };
 
-function makeHandle(sessionId, opts = {}) {
-  const texts = [...(opts.texts ?? [])];
-  const reasons = [...(opts.reasons ?? ["completed"])];
-  let busy = false;
-  let release = null;
+function envelope({ id = "cluster-dispatch-1", text = "hello", contextId, taskId, workspace, sessionId } = {}) {
+  return {
+    id,
+    toNodeId: "1",
+    correlationId: null,
+    payloadType: "dsh.a2a.message",
+    payload: {
+      ...(workspace ? { workspace } : {}),
+      ...(sessionId ? { sessionId } : {}),
+      a2a: {
+        role: "ROLE_USER",
+        messageId: `message-${id}`,
+        parts: [{ text }],
+        ...(contextId ? { contextId } : {}),
+        ...(taskId ? { taskId } : {}),
+      },
+    },
+    timestampUtc: new Date().toISOString(),
+  };
+}
+
+function createHarness({ finishReason = "completed", replyText = "DSH reply", createError, maxConcurrency = 4 } = {}) {
+  const reports = [];
+  const work = { createCalls: 0, followupCalls: 0 };
+  const logs = { info: [], warn: [], error: [] };
+  const harnessLog = {
+    info(_area, message) { logs.info.push(message); },
+    warn(_area, message) { logs.warn.push(message); },
+    error(_area, message) { logs.error.push(message); },
+    debug() {},
+  };
   const handle = {
-    sessionId,
-    prompts: [],
     agent: {
-      session: { id: sessionId, seq: 0, events: [] },
+      session: { id: "dsh-private-session", seq: 0, events: [] },
+      followup() {
+        work.followupCalls += 1;
+        const session = this.session;
+        session.seq += 1;
+        session.events.push({ seq: session.seq, type: "turn/start", time: Date.now(), data: {} });
+        session.seq += 1;
+        session.events.push({ seq: session.seq, type: "assistant/message", time: Date.now(), data: { message: { content: [{ type: "text", text: replyText }] } } });
+        session.seq += 1;
+        session.events.push({ seq: session.seq, type: "turn/end", time: Date.now(), data: { reason: { kind: finishReason } } });
+      },
+      async whenIdle() {},
       cancel() {},
-      followup(msg) {
-        handle.prompts.push(msg);
-        const s = handle.agent.session;
-        s.seq += 1;
-        s.events.push({ seq: s.seq, type: "turn/start", time: Date.now(), data: {} });
-        s.seq += 1;
-        const text = texts.length > 0 ? texts.shift() : `reply-${handle.prompts.length}`;
-        s.events.push({ seq: s.seq, type: "assistant/message", time: Date.now(), data: { message: { content: [{ type: "text", text }] } } });
-        s.seq += 1;
-        const reason = reasons.length > 1 ? reasons.shift() : reasons[0];
-        s.events.push({ seq: s.seq, type: "turn/end", time: Date.now(), data: { reason: { kind: reason } } });
-        busy = true;
-      },
-      async whenIdle() {
-        if (!busy) return;
-        await new Promise((resolve) => {
-          release = resolve;
-        });
-      },
     },
     dispose: async () => {},
   };
-  handle.settle = () => {
-    const r = release;
-    release = null;
-    r?.();
-  };
-  // A real agent finishes its turn autonomously; emulate by releasing the
-  // idle gate right after followup (next macrotask so callers can observe
-  // the working state in between).
-  const originalFollowup = handle.agent.followup.bind(handle.agent);
-  handle.agent.followup = (msg) => {
-    originalFollowup(msg);
-    setTimeout(() => {
-      busy = false;
-      handle.settle();
-    }, 0);
-  };
-  return handle;
-}
-
-function makeHarness({ registryMock, reasonPlan } = {}) {
-  const listeners = {};
-  const createdSessions = [];
-  const taskEvents = [];
-  const handles = {};
-  const plan = [...(reasonPlan ?? [])];
   const ctx = {
-    on(event, fn) {
-      (listeners[event] ??= []).push(fn);
-    },
-    get(key) {
-      if (key === "workspaceRegistry") return registryMock;
-      return undefined;
-    },
+    get() { return undefined; },
+    on() {},
     agents: {
-      async create(options) {
-        const id = options.sessionId;
-        createdSessions.push(id);
-        const reasons = plan.length > 0 ? plan.shift() : ["completed"];
-        if (!handles[id]) handles[id] = makeHandle(id, { reasons });
-        return handles[id];
+      async create() {
+        work.createCalls += 1;
+        if (createError) throw createError;
+        return handle;
       },
     },
     sessions: { flush: async () => {} },
   };
-  const hub = {
-    reportTaskEvent: async (event) => {
-      taskEvents.push(event);
-      return true;
-    },
-  };
-  const config = { maxConcurrency: 4, workspaceRoots: [], workspace: "/tmp/default-ws" };
   const registry = new TaskRegistry();
-  const contexts = new ContextRegistry(quietLog);
-  const buffer = new EventBuffer(1000);
-  const relay = new EventRelay(ctx, contexts, registry, buffer, quietLog);
-  const counters = { processedTasks: 0, failedTasks: 0 };
-  const intake = new TaskIntake(ctx, config, registry, contexts, hub, relay, quietLog, counters);
-  const fire = (event, ...args) => (listeners[event] ?? []).forEach((fn) => fn(...args));
-  return { ctx, hub, intake, registry, contexts, buffer, relay, createdSessions, taskEvents, counters, fire };
+  const contexts = new ContextRegistry(harnessLog);
+  let intake;
+  const relay = new EventRelay(
+    ctx,
+    contexts,
+    (runtimeAgentId) => intake?.contextIdForRuntimeAgent(runtimeAgentId),
+    registry,
+    new EventBuffer(10),
+    harnessLog,
+  );
+  intake = new TaskIntake(
+    ctx,
+    { maxConcurrency, workspaceRoots: [], workspace: "/tmp" },
+    registry,
+    contexts,
+    { reportPayload: async (payload) => { reports.push(payload); return true; } },
+    relay,
+    harnessLog,
+    { processedTasks: 0, failedTasks: 0 },
+  );
+  return { intake, reports, registry, contexts, work, logs };
 }
 
-function a2aEnvelope({ text, taskId, contextId, workspace }) {
-  const metadata = workspace ? { workspace } : {};
-  return {
-    messageId: `delivery-${Math.random().toString(16).slice(2)}`,
-    fromNodeId: "9",
-    toNodeId: "1",
-    correlationId: null,
-    timestampUtc: new Date().toISOString(),
-    message: {
-      role: "ROLE_USER",
-      parts: [{ text }],
-      messageId: `msg-${Math.random().toString(16).slice(2)}`,
-      ...(taskId ? { taskId } : {}),
-      ...(contextId ? { contextId } : {}),
-      metadata,
-    },
-  };
-}
-
-async function waitFor(condition, label, timeoutMs = 2000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (condition()) return;
-    await new Promise((r) => setTimeout(r, 5));
+async function waitFor(predicate) {
+  for (let index = 0; index < 100; index += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  assert.ok(condition(), `timeout waiting for ${label}`);
+  assert.ok(predicate(), "timed out");
 }
 
-export { makeHarness };
+function assertTerminalFailure(report, messagePattern, expectedContextId) {
+  assert.equal(report.payload.a2a.status.state, "TASK_STATE_FAILED");
+  assert.ok(report.payload.a2a.taskId, "failure has an opaque A2A taskId");
+  assert.ok(report.payload.a2a.contextId, "official A2A wire requires a non-empty contextId");
+  if (expectedContextId) assert.equal(report.payload.a2a.contextId, expectedContextId);
+  assert.equal("sessionId" in report.payload, false, "untrusted DSH sessionId must be omitted");
+  assert.ok(report.payload.a2a.status.message.messageId, "failure has a legal A2A messageId");
+  assert.match(report.payload.a2a.status.message.parts[0].text, messagePattern);
+}
 
-test("first message creates server-owned context+taskId; dshSessionId is opaque (never derived)", async () => {
-  const h = makeHarness();
-  h.intake.onA2AMessage(a2aEnvelope({ text: "hello" }));
-  await waitFor(() => h.taskEvents.some((e) => e.kind === "started"), "started");
+test("v2 DSH input produces correlated A2A status payloads and ignores reserved sessionId", async () => {
+  const h = createHarness();
+  h.intake.onPayloadDispatched(envelope({ id: "cluster-dispatch-42", sessionId: "prior-dsh-session" }));
+  await waitFor(() => h.reports.some((item) => item.payloadType === "dsh.a2a.task-status-update" && item.payload.a2a.status?.state === "TASK_STATE_COMPLETED"));
 
-  const started = h.taskEvents.find((e) => e.kind === "started");
-  const contextId = started.contextId;
-  const taskId = started.taskId;
-  assert.ok(contextId && taskId, "both ids are generated and echoed");
-  const record = h.contexts.get(contextId);
-  assert.ok(record, "context record exists");
-  assert.notEqual(record.dshSessionId, "", "canonical dshSessionId confirmed");
-  assert.notEqual(record.dshSessionId, contextId, "dshSessionId != contextId");
-  assert.equal(h.createdSessions.length, 1);
-  assert.notEqual(h.createdSessions[0], contextId, "creation seed never derives from an A2A id");
-  assert.notEqual(h.createdSessions[0], taskId, "creation seed never derives from an A2A id");
-
-  // status-update carries the official wire shape
-  const statusUpdate = h.taskEvents.filter((e) => e.kind === "a2a.status-update");
-  assert.ok(statusUpdate.length >= 2, "working + completed updates emitted");
-  assert.equal(statusUpdate[0].data.contextId, contextId);
-  assert.equal(statusUpdate[0].data.taskId, taskId);
-
-  await waitFor(() => h.counters.processedTasks === 1, "completed");
+  const completed = h.reports.find((item) => item.payload.a2a.status?.state === "TASK_STATE_COMPLETED");
+  assert.equal(completed.toNodeId, "server");
+  assert.equal(completed.correlationId, "cluster-dispatch-42");
+  assert.notEqual(completed.id, completed.correlationId);
+  assert.equal("sessionId" in completed.payload, false, "DSH does not assign meaning to the reserved sessionId");
+  assert.ok(completed.payload.a2a.taskId);
+  assert.notEqual(completed.payload.a2a.taskId, completed.correlationId);
+  assert.ok(completed.payload.a2a.status.message.messageId);
+  assert.match(completed.payload.a2a.status.message.parts[0].text, /DSH reply/);
 });
 
-test("same context + no taskId starts a NEW task on the SAME dsh session", async () => {
-  const h = makeHarness();
-  h.intake.onA2AMessage(a2aEnvelope({ text: "first" }));
-  await waitFor(() => h.counters.processedTasks === 1, "first done");
-  const first = h.taskEvents.find((e) => e.kind === "started");
-  const createsAfterFirst = h.createdSessions.length;
+test("exact duplicate outer dispatch executes once while active and replays the identical terminal return", async () => {
+  const h = createHarness();
+  const request = envelope({ id: "dispatch-idempotent", text: "run once" });
 
-  h.intake.onA2AMessage(a2aEnvelope({ text: "second", contextId: first.contextId }));
-  await waitFor(() => h.taskEvents.filter((e) => e.kind === "started").length === 2, "second started");
-  const second = h.taskEvents.filter((e) => e.kind === "started")[1];
-  assert.notEqual(second.taskId, first.taskId, "new server-generated taskId");
-  assert.equal(second.contextId, first.contextId, "same conversation context");
-  await waitFor(() => h.counters.processedTasks === 2, "second done");
-  assert.equal(h.createdSessions.length, createsAfterFirst, "no new dsh session for the same context");
-  assert.equal(h.contexts.get(first.contextId).activeTaskId, null, "active cleared after terminal");
+  h.intake.onPayloadDispatched(request);
+  h.intake.onPayloadDispatched(structuredClone(request));
+  h.intake.onPayloadDispatched(envelope({ id: "dispatch-idempotent", text: "conflicting while active" }));
+  await waitFor(() => h.reports.some((item) =>
+    item.correlationId === "dispatch-idempotent" &&
+    item.payload.a2a.status?.state === "TASK_STATE_COMPLETED"));
+
+  const original = structuredClone(h.reports.find((item) =>
+    item.correlationId === "dispatch-idempotent" &&
+    item.payload.a2a.status?.state === "TASK_STATE_COMPLETED"));
+  assert.equal(h.work.createCalls, 1);
+  assert.equal(h.work.followupCalls, 1);
+  assert.equal(h.reports.filter((item) =>
+    item.correlationId === "dispatch-idempotent" &&
+    item.payload.a2a.status?.state === "TASK_STATE_COMPLETED").length, 1);
+
+  const reportCount = h.reports.length;
+  h.intake.onPayloadDispatched(structuredClone(request));
+  await waitFor(() => h.reports.length === reportCount + 1);
+
+  assert.deepEqual(h.reports.at(-1), original);
+  assert.equal(h.work.createCalls, 1);
+  assert.equal(h.work.followupCalls, 1);
+  assert.ok(h.logs.info.some((message) => message.includes("duplicate active outer dispatch")));
+  assert.ok(h.logs.info.some((message) => message.includes("replaying the recorded terminal return")));
+  assert.ok(h.logs.error.some((message) => message.includes("correlation conflict rejected")));
 });
 
-test("unknown taskId -> task-not-found rejection with zero side effects", async () => {
-  const h = makeHarness();
-  h.intake.onA2AMessage(a2aEnvelope({ text: "hi", taskId: "does-not-exist" }));
-  await waitFor(() => h.taskEvents.length > 0, "rejection");
-  const failed = h.taskEvents.find((e) => e.kind === "failed");
-  assert.match(failed.message, /task not found/);
-  assert.equal(h.createdSessions.length, 0, "no session created");
-  assert.equal(h.registry.list().length, 0, "no task record created");
+test("same outer correlation with changed payload, context, or workspace is rejected while reserved sessionId is ignored", async () => {
+  const h = createHarness();
+  const request = envelope({ id: "dispatch-conflict", text: "authoritative" });
+  h.intake.onPayloadDispatched(request);
+  await waitFor(() => h.reports.some((item) =>
+    item.correlationId === "dispatch-conflict" &&
+    item.payload.a2a.status?.state === "TASK_STATE_COMPLETED"));
+  const terminal = h.reports.find((item) =>
+    item.correlationId === "dispatch-conflict" &&
+    item.payload.a2a.status?.state === "TASK_STATE_COMPLETED");
+  const reportCount = h.reports.length;
+
+  h.intake.onPayloadDispatched(envelope({ id: "dispatch-conflict", text: "changed" }));
+  h.intake.onPayloadDispatched(envelope({ id: "dispatch-conflict", text: "authoritative", contextId: terminal.payload.a2a.contextId }));
+  h.intake.onPayloadDispatched(envelope({ id: "dispatch-conflict", text: "authoritative", sessionId: "different-session" }));
+  h.intake.onPayloadDispatched(envelope({ id: "dispatch-conflict", text: "authoritative", workspace: "/different/workspace" }));
+
+  await waitFor(() => h.reports.length === reportCount + 1);
+  assert.deepEqual(h.reports.at(-1), terminal, "a reserved sessionId variant replays the authoritative terminal result");
+  assert.equal(h.work.createCalls, 1);
+  assert.equal(h.work.followupCalls, 1);
+  assert.equal(
+    h.logs.error.filter((message) => message.includes("correlation conflict rejected")).length,
+    3,
+    JSON.stringify(h.logs.error),
+  );
 });
 
-test("unknown contextId -> explicit rejection, no substitute generation", async () => {
-  const h = makeHarness();
-  h.intake.onA2AMessage(a2aEnvelope({ text: "hi", contextId: "client-invented-context" }));
-  await waitFor(() => h.taskEvents.length > 0, "rejection");
-  const failed = h.taskEvents.find((e) => e.kind === "failed");
-  assert.match(failed.message, /unknown contextId/);
-  assert.equal(failed.contextId, "client-invented-context", "rejected with the provided id, not a replacement");
-  assert.equal(h.createdSessions.length, 0, "no session created");
-  assert.equal([...h.contexts.list()].length, 0, "no context record created");
-});
+test("outer dispatch ledger is bounded without evicting active work", () => {
+  const registry = new TaskRegistry(20, 1000, 2);
+  assert.deepEqual(registry.claimDispatch("dispatch-a", "request-a"), { kind: "accepted" });
+  assert.deepEqual(registry.claimDispatch("dispatch-b", "request-b"), { kind: "accepted" });
+  assert.deepEqual(registry.claimDispatch("dispatch-c", "request-c"), { kind: "capacity-exhausted" });
 
-test("mismatched contextId/taskId -> rejection with zero side effects", async () => {
-  const h = makeHarness();
-  h.intake.onA2AMessage(a2aEnvelope({ text: "seed" }));
-  await waitFor(() => h.counters.processedTasks === 1, "seed done");
-  const first = h.taskEvents.find((e) => e.kind === "started");
-  const otherContext = "another-context";
-
-  h.intake.onA2AMessage(a2aEnvelope({ text: "conflict", taskId: first.taskId, contextId: otherContext }));
-  await waitFor(() => h.taskEvents.some((e) => e.kind === "failed" && e.taskId === first.taskId), "mismatch rejection");
-  const failed = h.taskEvents.find((e) => e.kind === "failed" && e.taskId === first.taskId);
-  assert.match(failed.message, /does not match/);
-  assert.equal(h.createdSessions.length, 1, "no extra session");
-  assert.equal(h.counters.processedTasks, 1, "no extra completed task");
-});
-
-test("two tasks in one context serialize; both run on ONE dsh session", async () => {
-  const h = makeHarness();
-  h.intake.onA2AMessage(a2aEnvelope({ text: "task-one" }));
-  await waitFor(() => h.counters.processedTasks === 1, "first done");
-  const first = h.taskEvents.find((e) => e.kind === "started");
-
-  h.intake.onA2AMessage(a2aEnvelope({ text: "task-two", contextId: first.contextId }));
-  await waitFor(() => h.taskEvents.filter((e) => e.kind === "started").length === 2, "second started");
-  await waitFor(() => h.counters.processedTasks === 2, "second done");
-
-  // Both turns used ONE dsh session; the second task got its own taskId.
-  assert.equal(h.createdSessions.length, 1);
-});
-
-test("taskDispatched with a KNOWN contextId + new taskId continues the conversation (regression: used to crash via 'context already exists')", async () => {
-  const h = makeHarness();
-  // Seed one context with a context-less dispatch.
-  h.intake.onTaskDispatched({ taskId: "coord-task-1", prompt: "seed" });
-  await waitFor(() => h.counters.processedTasks === 1, "seed done");
-  const first = h.taskEvents.find((e) => e.kind === "started");
-  assert.ok(first.contextId, "context generated for context-less dispatch");
-  const createsAfterSeed = h.createdSessions.length;
-
-  // Pre-fix crash scenario: a NEW coordinator taskId carrying an EXISTING
-  // contextId reached startNewContextTask -> contexts.create() threw
-  // "context already exists"; its unhandled rejection killed the host process.
-  h.intake.onTaskDispatched({ taskId: "coord-task-2", prompt: "follow-up", contextId: first.contextId });
-  await waitFor(() => h.taskEvents.filter((e) => e.kind === "started").length === 2, "follow-up started");
-  const second = h.taskEvents.filter((e) => e.kind === "started")[1];
-  assert.equal(second.taskId, "coord-task-2", "coordinator-provided identity kept");
-  assert.equal(second.contextId, first.contextId, "same conversation context");
-  await waitFor(() => h.counters.processedTasks === 2, "follow-up done");
-  assert.equal(h.createdSessions.length, createsAfterSeed, "reused the existing dsh session; no re-create attempt");
-});
-
-test("relay drops events for node-owned sessions without an active task", async () => {
-  const h = makeHarness();
-  h.intake.onA2AMessage(a2aEnvelope({ text: "hello" }));
-  await waitFor(() => h.counters.processedTasks === 1, "done");
-  const first = h.taskEvents.find((e) => e.kind === "started");
-  const record = h.contexts.get(first.contextId);
-  const before = h.buffer.size;
-
-  h.fire("session/event", { id: record.dshSessionId }, { type: "tool/call", time: Date.now(), data: { name: "x" } });
-  assert.equal(h.buffer.size, before, "dropped: no active task");
-
-  h.fire("session/event", { id: "some-other-user-session" }, { type: "tool/call", time: Date.now(), data: { name: "y" } });
-  assert.equal(h.buffer.size, before, "foreign sessions ignored entirely");
-});
-
-test("input-required holds the queue until the same taskId continues it", async () => {
-  const wsRoot = mkdtempSync(join(tmpdir(), "a2a-fixtures-"));
-  try {
-    // First conversation turn ends blocked; every later turn completes.
-    const h = makeHarness({
-      reasonPlan: [["blocked", "completed"]],
-      registryMock: {
-        get: () => undefined,
-        list: () => [],
-        resolveByPath: async () => undefined,
-        create: async (path) => ({ path, attachSession: async () => {} }),
-      },
-    });
-
-    h.intake.onA2AMessage(a2aEnvelope({ text: "need input", workspace: join(wsRoot, "ws-a") }));
-    await waitFor(() => h.registry.listActive().some((t) => t.state === "input-required"), "input-required held");
-    const first = h.taskEvents.find((e) => e.kind === "started");
-    assert.equal(h.contexts.get(first.contextId).activeTaskId, first.taskId, "still the active task");
-
-    // A new task in the same context queues BEHIND the input-required hold.
-    h.intake.onA2AMessage(a2aEnvelope({ text: "queued behind", contextId: first.contextId }));
-    await waitFor(() => h.contexts.get(first.contextId).queuedTaskIds.length === 1, "queued");
-    assert.equal(h.contexts.get(first.contextId).activeTaskId, first.taskId, "queue does not bypass input-required");
-
-    // Continue the SAME taskId: back to working, completes; queue advances.
-    h.intake.onA2AMessage(a2aEnvelope({ text: "here is the input", taskId: first.taskId, contextId: first.contextId }));
-    await waitFor(() => !h.registry.listActive().some((t) => t.taskId === first.taskId), "held task settled");
-    await waitFor(() => h.contexts.get(first.contextId).activeTaskId !== first.taskId && h.counters.processedTasks === 2, "queue advanced and finished");
-    assert.equal(h.createdSessions.length, 1, "still one dsh session");
-
-    // Workspace conflict: same context, different workspace hint -> rejected.
-    h.intake.onA2AMessage(a2aEnvelope({ text: "conflict", contextId: first.contextId, workspace: join(wsRoot, "ws-b") }));
-    await waitFor(() => h.taskEvents.some((e) => e.kind === "failed" && /workspace conflict/.test(e.message ?? "")), "workspace conflict rejected");
-  } finally {
-    await rm(wsRoot, { recursive: true, force: true });
-  }
-});
-
-test("a2a.status-update carries the surfaced text in status.message for terminal/blocking states", async () => {
-  // completed
-  const done = makeHarness();
-  done.intake.onA2AMessage(a2aEnvelope({ text: "hello" }));
-  await waitFor(() => done.counters.processedTasks === 1, "completed");
-  const completed = done.taskEvents.find((e) => e.kind === "a2a.status-update" && e.data?.status?.state === "TASK_STATE_COMPLETED");
-  assert.ok(completed, "completed a2a.status-update emitted");
-  assert.equal(completed.data.status.message.role, "ROLE_AGENT");
-  assert.ok(completed.data.status.message.messageId, "completed carries a non-empty messageId (server rejects a missing id)");
-  assert.match(completed.data.status.message.parts[0].text, /./, "completed carries a non-empty reply text");
-
-  // failed (turn ends with an error reason)
-  const failed = makeHarness({ reasonPlan: [["error", "completed"]] });
-  failed.intake.onA2AMessage(a2aEnvelope({ text: "boom" }));
-  await waitFor(() => failed.counters.failedTasks === 1, "failed");
-  const failedUpdate = failed.taskEvents.find((e) => e.kind === "a2a.status-update" && e.data?.status?.state === "TASK_STATE_FAILED");
-  assert.ok(failedUpdate, "failed a2a.status-update emitted");
-  assert.ok(failedUpdate.data.status.message.messageId, "failed carries a messageId");
-  assert.ok(failedUpdate.data.status.message.parts[0].text.length > 0, "failed carries a status.message text");
-
-  // input-required (blocked turn) carries a status.message
-  const blocked = makeHarness({
-    reasonPlan: [["blocked", "completed"]],
-    registryMock: {
-      get: () => undefined,
-      list: () => [],
-      resolveByPath: async () => undefined,
-      create: async (path) => ({ path, attachSession: async () => {} }),
-    },
+  registry.completeDispatch("dispatch-a", {
+    id: "return-a",
+    toNodeId: "server",
+    correlationId: "dispatch-a",
+    payloadType: "dsh.a2a.task-status-update",
+    payload: { a2a: { taskId: "task-a", contextId: "context-a", status: { state: "TASK_STATE_FAILED" } } },
+    timestampUtc: "2026-09-01T00:00:00.000Z",
   });
-  blocked.intake.onA2AMessage(a2aEnvelope({ text: "need input" }));
-  await waitFor(() => blocked.registry.listActive().some((t) => t.state === "input-required"), "input-required");
-  const blockedUpdate = blocked.taskEvents.find((e) => e.kind === "a2a.status-update" && e.data?.status?.state === "TASK_STATE_INPUT_REQUIRED");
-  assert.ok(blockedUpdate, "input-required a2a.status-update emitted");
-  assert.ok(blockedUpdate.data.status.message.messageId, "input-required carries a messageId");
-  assert.ok(blockedUpdate.data.status.message.parts[0].text.length > 0, "input-required carries a status.message text");
+  assert.deepEqual(registry.claimDispatch("dispatch-c", "request-c"), { kind: "accepted" });
+  assert.deepEqual(registry.claimDispatch("dispatch-a", "request-a"), { kind: "capacity-exhausted" });
+});
 
-  // working carries NO status.message (and therefore no messageId)
-  const working = done.taskEvents.find((e) => e.kind === "a2a.status-update" && e.data?.status?.state === "TASK_STATE_WORKING");
-  assert.ok(working, "working a2a.status-update emitted");
-  assert.equal(working.data.status.message, undefined, "working carries no status.message");
+test("max concurrency before context creation returns replayable terminal failure", async () => {
+  const h = createHarness({ maxConcurrency: 1 });
+  h.registry.begin("busy-task", "busy-context", "payload", "busy-dispatch");
+  const request = envelope({ id: "dispatch-at-capacity" });
+
+  h.intake.onPayloadDispatched(request);
+  await waitFor(() => h.reports.some((item) => item.correlationId === "dispatch-at-capacity"));
+  const failed = h.reports.find((item) => item.correlationId === "dispatch-at-capacity");
+  assertTerminalFailure(failed, /max concurrency reached/);
+  assert.equal(h.work.createCalls, 0);
+
+  const original = structuredClone(failed);
+  const reportCount = h.reports.length;
+  h.intake.onPayloadDispatched(structuredClone(request));
+  await waitFor(() => h.reports.length === reportCount + 1);
+  assert.deepEqual(h.reports.at(-1), original);
+});
+
+test("transient runtime-agent creation failure rolls back provisional context and returns replayable terminal failure", async () => {
+  const h = createHarness({ createError: new Error("DSH unavailable") });
+  const request = envelope({ id: "dispatch-create-failed", sessionId: "ignored-reserved-value" });
+
+  h.intake.onPayloadDispatched(request);
+  await waitFor(() => h.reports.some((item) => item.correlationId === "dispatch-create-failed"));
+  const failed = h.reports.find((item) => item.correlationId === "dispatch-create-failed");
+  assertTerminalFailure(failed, /runtime handle create failed: DSH unavailable/);
+  assert.equal(h.contexts.list().length, 0, "the provisional context is rolled back");
+  assert.equal(h.work.createCalls, 1);
+  assert.equal(h.work.followupCalls, 0);
+
+  const original = structuredClone(failed);
+  const reportCount = h.reports.length;
+  h.intake.onPayloadDispatched(structuredClone(request));
+  await waitFor(() => h.reports.length === reportCount + 1);
+  assert.deepEqual(h.reports.at(-1), original);
+  assert.equal(h.work.createCalls, 1);
+});
+
+test("unexpected accept exception seals the claimed dispatch as terminal failure", async () => {
+  const h = createHarness();
+  h.registry.activeCount = () => { throw new Error("unexpected registry failure"); };
+  const request = envelope({ id: "dispatch-accept-crash" });
+
+  h.intake.onPayloadDispatched(request);
+  await waitFor(() => h.reports.some((item) => item.correlationId === "dispatch-accept-crash"));
+  const failed = h.reports.find((item) => item.correlationId === "dispatch-accept-crash");
+  assertTerminalFailure(failed, /payload accept failed: unexpected registry failure/);
+
+  const original = structuredClone(failed);
+  const reportCount = h.reports.length;
+  h.intake.onPayloadDispatched(structuredClone(request));
+  await waitFor(() => h.reports.length === reportCount + 1);
+  assert.deepEqual(h.reports.at(-1), original);
+});
+
+test("v2 continuation retains the A2A context and uses a new A2A task ID", async () => {
+  const h = createHarness();
+  h.intake.onPayloadDispatched(envelope({ id: "dispatch-one" }));
+  await waitFor(() => h.reports.some((item) => item.correlationId === "dispatch-one" && item.payload.a2a.status?.state === "TASK_STATE_COMPLETED"));
+  const first = h.reports.find((item) => item.correlationId === "dispatch-one" && item.payload.a2a.status?.state === "TASK_STATE_COMPLETED");
+
+  h.intake.onPayloadDispatched(envelope({ id: "dispatch-two", contextId: first.payload.a2a.contextId, sessionId: "ignored-reserved-value" }));
+  await waitFor(() => h.reports.some((item) => item.correlationId === "dispatch-two" && item.payload.a2a.status?.state === "TASK_STATE_COMPLETED"));
+  const second = h.reports.find((item) => item.correlationId === "dispatch-two" && item.payload.a2a.status?.state === "TASK_STATE_COMPLETED");
+
+  assert.equal(second.payload.a2a.contextId, first.payload.a2a.contextId);
+  assert.notEqual(second.payload.a2a.taskId, first.payload.a2a.taskId);
+  assert.equal("sessionId" in second.payload, false);
+});
+
+test("non-DSH payload type is rejected before task creation", () => {
+  const h = createHarness();
+  h.intake.onPayloadDispatched({ ...envelope(), payloadType: "other.message" });
+  assert.equal(h.registry.list().length, 0);
+  assert.equal(h.reports.length, 0);
+});
+
+test("context registry restore is idempotent by A2A context only", () => {
+  const h = createHarness();
+  const first = h.contexts.restore("context-a");
+  assert.equal(h.contexts.restore("context-a"), first);
+  h.contexts.restore("context-b");
+  assert.equal(h.contexts.get("context-b")?.contextId, "context-b");
+});
+
+test("node restart restores persisted A2A context and creates a transient runtime agent", async () => {
+  const h = createHarness();
+  h.intake.onPayloadDispatched(envelope({
+    id: "dispatch-after-restart",
+    contextId: "persisted-context",
+    sessionId: "reserved-value-is-ignored",
+  }));
+
+  await waitFor(() => h.reports.some((item) =>
+    item.correlationId === "dispatch-after-restart" &&
+    item.payload.a2a.status?.state === "TASK_STATE_COMPLETED"));
+  const completed = h.reports.find((item) =>
+    item.correlationId === "dispatch-after-restart" &&
+    item.payload.a2a.status?.state === "TASK_STATE_COMPLETED");
+
+  assert.equal(completed.payload.a2a.contextId, "persisted-context");
+  assert.equal("sessionId" in completed.payload, false);
+  assert.equal(h.contexts.get("persisted-context")?.contextId, "persisted-context");
+  assert.equal(h.work.createCalls, 1, "the node creates a new transient runtime agent");
+});
+
+test("node accepts a persisted context without a runtime session", async () => {
+  const h = createHarness();
+  const request = envelope({
+    id: "dispatch-restored-context",
+    contextId: "missing-context",
+  });
+  h.intake.onPayloadDispatched(request);
+
+  await waitFor(() => h.reports.some((item) => item.correlationId === "dispatch-restored-context" && item.payload.a2a.status?.state === "TASK_STATE_COMPLETED"));
+  const completed = h.reports.find((item) => item.correlationId === "dispatch-restored-context");
+  assert.equal(completed.payload.a2a.contextId, "missing-context");
+  assert.equal(h.contexts.get("missing-context")?.contextId, "missing-context");
+  assert.equal(h.registry.list().length, 0);
+});
+
+test("payload input-required is surfaced as terminal failure and releases the context queue", async () => {
+  const h = createHarness({ finishReason: "blocked" });
+  h.intake.onPayloadDispatched(envelope({ id: "dispatch-blocked" }));
+  await waitFor(() => h.reports.some((item) =>
+    item.correlationId === "dispatch-blocked" &&
+    item.payload.a2a.status?.state === "TASK_STATE_FAILED"));
+
+  const failed = h.reports.find((item) =>
+    item.correlationId === "dispatch-blocked" &&
+    item.payload.a2a.status?.state === "TASK_STATE_FAILED");
+  assert.match(failed.payload.a2a.status.message.parts[0].text, /do not support resuming a held task/);
+  assert.equal(h.registry.list().length, 0);
+  const context = h.contexts.get(failed.payload.a2a.contextId);
+  assert.equal(context.activeTaskId, null);
+  assert.deepEqual(context.queuedTaskIds, []);
+
+  h.intake.onPayloadDispatched(envelope({
+    id: "dispatch-after-blocked",
+    contextId: failed.payload.a2a.contextId,
+    sessionId: "ignored-reserved-value",
+  }));
+  await waitFor(() => h.reports.some((item) =>
+    item.correlationId === "dispatch-after-blocked" &&
+    item.payload.a2a.status?.state === "TASK_STATE_FAILED"));
+  assert.equal(h.work.followupCalls, 2, "the released context accepts the next ChatPush message");
+});
+
+test("reserved sessionId does not alter an existing A2A context", async () => {
+  const h = createHarness();
+  h.intake.onPayloadDispatched(envelope({ id: "dispatch-trusted-seed" }));
+  await waitFor(() => h.reports.some((item) =>
+    item.correlationId === "dispatch-trusted-seed" &&
+    item.payload.a2a.status?.state === "TASK_STATE_COMPLETED"));
+  const seed = h.reports.find((item) =>
+    item.correlationId === "dispatch-trusted-seed" &&
+    item.payload.a2a.status?.state === "TASK_STATE_COMPLETED");
+
+  h.intake.onPayloadDispatched(envelope({
+    id: "dispatch-trusted-followup",
+    contextId: seed.payload.a2a.contextId,
+    sessionId: "wrong-session",
+  }));
+  await waitFor(() => h.reports.some((item) => item.correlationId === "dispatch-trusted-followup" && item.payload.a2a.status?.state === "TASK_STATE_COMPLETED"));
+  const completed = h.reports.find((item) => item.correlationId === "dispatch-trusted-followup");
+  assert.equal(completed.payload.a2a.contextId, seed.payload.a2a.contextId);
+  assert.equal("sessionId" in completed.payload, false);
+  assert.equal(h.work.createCalls, 1);
+  assert.equal(h.work.followupCalls, 2);
 });

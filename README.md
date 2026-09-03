@@ -92,9 +92,18 @@ Docker 一键方案见仓库根 `Dockerfile`。
 - **同一对话开新任务**：已知 `contextId`、无 `taskId` → 新建服务端生成的 taskId，复用该 context 的 DSH 会话。
 - **继续既有任务**：带已知 `taskId`（`contextId` 可选）→ 继续该 task 所属 context 的 DSH 会话；终态任务的引用会开启同对话的新任务（旧任务记录不可变）。
 - **强制拒绝（零副作用）**：未知 `taskId`（task not found）、未知 `contextId`（server-owned policy，不生成替代值）、`taskId` 与 `contextId` 不匹配、同 context 换 workspace、私有 `sessionId` 与 context 会话不一致（DshSessionMismatch）。
-- **串行**：同一 context 的 prompt 执行严格串行（submitted FIFO → working → 终态）；`input-required` 保持占用队列，只有相同 `taskId` 的后续消息可继续它。
-- 所有状态转换通过 `reportTaskEvent(kind=a2a.status-update)` 携带官方 A2A `TaskStatusUpdateEvent`（官方 SDK 序列化），同时保留 started/completed/failed 调度约定事件；两种事件都回传 `taskId` + `contextId`。
-- 进程重启不恢复内存映射：重启后旧 ID 一律按未知明确拒绝，不会为旧任务静默开新会话。
+- **串行**：同一 context 的 prompt 执行严格串行（submitted FIFO → working → 终态）。ClusterLink payload 是一次性的 ChatPush 消息，后续消息不会携带旧 taskId，因此节点不支持在这个通道挂起 `input-required`；agent 请求额外输入时会返回终态 `failed` 并释放 context 队列。
+- 所有状态转换通过 `reportPayload(payloadType=dsh.a2a.task-status-update)` 携带官方 A2A `TaskStatusUpdateEvent`（官方 SDK 序列化），并回传 `taskId` + `contextId` + 已确认的 DSH `sessionId`。
+- Host 重启后可把已持久化的 `contextId` + `sessionId` 完整配对重新发给节点，节点只在两侧均无冲突时恢复映射；不会从 outer dispatch、A2A task 或 context 派生 DSH session ID。
+
+### Outer dispatch 幂等边界
+
+- 节点在创建 task/context/session 之前，以 outer envelope `id` claim 一个进程内有界账本项；请求签名覆盖 `toNodeId`、outer `correlationId`、`payloadType` 和完整 `payload`，不包含重试时可变化的 envelope 时间戳。
+- 同一 `id` 的完全相同请求在原任务 active 时被忽略，不会重复创建 task/context/session 或再次调用 agent；原任务继续用该 `id` 回报。
+- 原任务 terminal 后，完全相同的请求重放账本保存的同一个完整终态 envelope，因此 taskId/contextId/sessionId、正文或失败、messageId、return envelope id 与时间戳都不变。
+- 在可信 context/session 尚未建立时（例如达到并发上限、新建 DSH session 失败、未知 context 且没有 session），节点通过官方 SDK 生成 pre-session terminal `failed`：保留 outer correlation，携带非空 opaque A2A taskId/contextId/messageId，同时省略尚未确认的 DSH sessionId；已有请求/已生成 contextId 时复用，否则随机生成，绝不从 outer correlation 或 DSH session 派生。发送前同样先写入幂等账本。已有可信 context 的拒绝必须回传注册表中的完整权威 pair。
+- 同一 `id` 携带不同 payload/context/session/workspace 属于协议冲突：节点明确记录错误并拒绝执行，同时保留原任务的权威结果。不能用同一 correlation 上报第二个终态，否则服务端无法区分冲突结果与原任务结果。
+- 该账本默认保留最近 1000 项，且**只保证同一节点进程内幂等**。节点进程重启或终态项因容量被淘汰后，节点无法独立保证 exactly-once；跨重启 exactly-once 需要另行引入节点持久化。当前实现不会假称通过 context/session 恢复获得了跨重启幂等。
 
 ## 卸载清理
 

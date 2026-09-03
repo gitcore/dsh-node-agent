@@ -8,6 +8,6 @@
  */
 import type { Context } from "@deepseek-ai/cordis";
 export declare const name = "dsh-node-agent";
-/** Required host services; agentDefaultModel is optional (resolved via ctx.get). */
+/** Required host services; agentDefaultModel and workspaceRegistry are optional (resolved via ctx.get). */
 export declare const inject: string[];
 export declare function apply(ctx: Context): void;

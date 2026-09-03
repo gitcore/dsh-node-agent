@@ -5,7 +5,7 @@
  * error-isolated; the node key never touches logs.
  */
 import { HubConnection, HubConnectionBuilder, HubConnectionState, HttpTransportType, LogLevel } from "@microsoft/signalr";
-import type { ClusterA2AMessage, ClusterA2AMessageEnvelope, ClusterNodeSnapshot, ClusterTaskDispatch, ClusterTaskEvent, PluginConfig } from "../protocol.js";
+import type { ClusterLinkPayloadEnvelope, ClusterNodeSnapshot, PluginConfig } from "../protocol.js";
 import { ReconnectPolicy } from "./reconnect-policy.js";
 import type { Logger } from "../services/log-buffer.js";
 
@@ -15,9 +15,7 @@ export interface HubCallbacks {
   onStateChange(state: ConnectionState): void;
   /** Fired right after a successful (re-)registration — the drain hook for the event buffer. */
   onRegistered(): void;
-  onTaskDispatched(payload: ClusterTaskDispatch): void;
-  onA2AMessage(message: ClusterA2AMessageEnvelope): void;
-  onTaskEventReceived(event: ClusterTaskEvent): void;
+  onPayloadDispatched(payload: ClusterLinkPayloadEnvelope): void;
 }
 
 export interface HubEventMetrics {
@@ -133,9 +131,7 @@ export class HubConnectionManager {
       this.setState("disconnected");
       this.log.warn("connection", `closed: ${error?.message ?? "clean"}`);
     });
-    connection.on("taskDispatched", (payload: ClusterTaskDispatch) => this.safe("onTaskDispatched", () => this.callbacks.onTaskDispatched(payload)));
-    connection.on("taskEventReceived", (event: ClusterTaskEvent) => this.safe("onTaskEventReceived", () => this.callbacks.onTaskEventReceived(event)));
-    connection.on("a2aMessageReceived", (message: ClusterA2AMessageEnvelope) => this.safe("onA2AMessage", () => this.callbacks.onA2AMessage(message)));
+    connection.on("payloadDispatched", (payload: ClusterLinkPayloadEnvelope) => this.safe("onPayloadDispatched", () => this.callbacks.onPayloadDispatched(payload)));
 
     this.setState("connecting");
     try {
@@ -174,7 +170,8 @@ export class HubConnectionManager {
     try {
       const snapshot = await connection.invoke("registerNode", {
         nodeId: this.config.nodeId,
-        link: { protocol: "dsh", version: this.config.dshVersion },
+        nodeType: "dsh",
+        link: { version: this.config.dshVersion },
       });
       this.snapshot = snapshot;
       this.registered = true;
@@ -201,30 +198,20 @@ export class HubConnectionManager {
     }
   }
 
-  /** Report one task event; returns false when the hub is not ready (caller buffers). */
-  async reportTaskEvent(event: ClusterTaskEvent): Promise<boolean> {
+  /** Report one v2 payload; returns false when the hub is not ready (caller buffers). */
+  async reportPayload(payload: ClusterLinkPayloadEnvelope): Promise<boolean> {
     if (!this.isReady) {
       this.metrics.reportsFailed++;
       return false;
     }
     try {
-      await this.connection!.invoke("reportTaskEvent", event);
+      await this.connection!.invoke("reportPayload", payload);
       this.metrics.reportsSent++;
       return true;
     } catch (error) {
       this.metrics.reportsFailed++;
-      this.log.warn("events", `reportTaskEvent(${event.taskId}, ${event.kind}) failed: ${errorMessage(error)}`, event.taskId);
+      this.log.warn("events", `reportPayload(${payload.correlationId ?? "?"}, ${payload.payloadType}) failed: ${errorMessage(error)}`, payload.correlationId ?? undefined);
       return false;
-    }
-  }
-
-  async sendA2AMessage(message: ClusterA2AMessage): Promise<ClusterA2AMessageEnvelope | undefined> {
-    if (!this.isReady) return undefined;
-    try {
-      return await this.connection!.invoke("sendA2AMessage", message);
-    } catch (error) {
-      this.log.warn("connection", `sendA2AMessage failed: ${errorMessage(error)}`);
-      return undefined;
     }
   }
 

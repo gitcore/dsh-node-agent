@@ -3,10 +3,9 @@
  * whitelisted types, redacts task content out of payloads, assigns per-task
  * forward seqs, and pushes into the EventBuffer.
  *
- * Attribution (dsh-a2a-context-session-mapping.md): a DSH event is mapped by
- * its dshSessionId -> context record -> activeTaskId. Only the active task's
- * events are forwarded; events that cannot be attributed are logged and
- * dropped — never guessed onto the nearest task.
+ * Attribution uses a transient runtime-agent callback supplied by task intake.
+ * It is never persisted or sent over ClusterLink; A2A contextId remains the
+ * sole conversation identity. Only the active task's events are forwarded.
  */
 import type { Context } from "@deepseek-ai/cordis";
 import type { Session, SessionEvent } from "@deepseek-ai/dsh-session";
@@ -42,12 +41,13 @@ export class EventRelay {
   constructor(
     private readonly ctx: Context,
     private readonly contexts: ContextRegistry,
+    private readonly resolveContextId: (runtimeAgentId: string) => string | undefined,
     private readonly tasks: TaskRegistry,
     private readonly buffer: EventBuffer,
     private readonly log: Logger,
   ) {
     ctx.on("session/event", (session: Session, event: SessionEvent) => {
-      const contextId = this.contexts.contextIdByDshSession(session.id);
+      const contextId = this.resolveContextId(session.id);
       if (!contextId) return; // not a node-owned conversation
       const record = this.contexts.get(contextId);
       if (!record) return;
@@ -82,9 +82,9 @@ export class EventRelay {
     });
   }
 
-  /** Map a DSH session id (or bare contextId) to its current active task. */
+  /** Resolve a transient runtime agent id (or bare contextId) to an active task. */
   private resolveActiveTask(id: string): string | null | undefined {
-    const contextId = this.contexts.contextIdByDshSession(id) ?? (this.contexts.has(id) ? id : undefined);
+    const contextId = this.resolveContextId(id) ?? (this.contexts.has(id) ? id : undefined);
     if (!contextId) return undefined;
     return this.contexts.get(contextId)?.activeTaskId ?? null;
   }

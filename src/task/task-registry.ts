@@ -3,7 +3,7 @@
  * (dsh-a2a-context-session-mapping.md "Required registry shape"). A task
  * record never holds a session id; session identity belongs to the context.
  */
-import type { AgentHandle } from "@deepseek-ai/dsh-agent";
+import type { ClusterLinkPayloadEnvelope } from "../protocol.js";
 
 /** A2A v1 task states (spec §4.1.3 vocabulary used by the mapping doc). */
 export const TASK_STATES = ["submitted", "working", "completed", "failed", "canceled", "input-required", "rejected", "auth-required"] as const;
@@ -15,7 +15,7 @@ export function isTerminalState(state: TaskState): boolean {
   return TERMINAL_STATES.has(state);
 }
 
-export type TaskSource = "taskDispatched" | "a2a";
+export type TaskSource = "payload";
 
 /** Result reference recorded when a task reaches a terminal state. */
 export interface TaskResult {
@@ -27,6 +27,8 @@ export interface TaskResult {
 
 export interface TaskRecord {
   taskId: string;
+  /** Original ClusterLink outer dispatch ID used for every return correlation. */
+  correlationId: string;
   /** Required reference key into the context registry. */
   contextId: string;
   source: TaskSource;
@@ -53,6 +55,26 @@ export interface TaskHistoryEntry {
   finalResponse?: string;
 }
 
+type DispatchLedgerState = "active" | "terminal";
+
+interface DispatchLedgerEntry {
+  correlationId: string;
+  requestSignature: string;
+  state: DispatchLedgerState;
+  taskId?: string;
+  contextId?: string;
+  terminalEnvelope?: ClusterLinkPayloadEnvelope;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type DispatchClaim =
+  | { kind: "accepted" }
+  | { kind: "duplicate-active"; taskId?: string; contextId?: string }
+  | { kind: "duplicate-terminal"; terminalEnvelope: ClusterLinkPayloadEnvelope }
+  | { kind: "conflict" }
+  | { kind: "capacity-exhausted" };
+
 export class TaskRegistry {
   private tasks = new Map<string, TaskRecord>();
   private readonly history: TaskHistoryEntry[] = [];
@@ -61,17 +83,96 @@ export class TaskRegistry {
    * later message can infer the context of a finished task (bounded).
    */
   private contexts = new Map<string, string>();
+  /**
+   * Process-local, bounded idempotency ledger for server-owned outer dispatch
+   * IDs. It deliberately is not reconstructed from A2A/context/session IDs and
+   * is not durable across a node process restart.
+   */
+  private readonly dispatches = new Map<string, DispatchLedgerEntry>();
 
   constructor(
     private readonly historyCapacity = 20,
     private readonly contextMemoryCapacity = 1000,
+    private readonly dispatchLedgerCapacity = 1000,
   ) {}
 
+  /**
+   * Claim one outer dispatch before any context/session/task side effect.
+   * Exact active duplicates are ignored; exact terminal duplicates replay the
+   * original terminal wire envelope. Reusing an ID for different request data
+   * is a protocol conflict and never executes.
+   */
+  claimDispatch(correlationId: string, requestSignature: string): DispatchClaim {
+    const existing = this.dispatches.get(correlationId);
+    if (existing) {
+      existing.updatedAt = Date.now();
+      if (existing.requestSignature !== requestSignature) return { kind: "conflict" };
+      if (existing.state === "terminal") {
+        if (!existing.terminalEnvelope) throw new Error(`terminal dispatch ${correlationId} has no replay envelope`);
+        return { kind: "duplicate-terminal", terminalEnvelope: structuredClone(existing.terminalEnvelope) };
+      }
+      return {
+        kind: "duplicate-active",
+        ...(existing.taskId ? { taskId: existing.taskId } : {}),
+        ...(existing.contextId ? { contextId: existing.contextId } : {}),
+      };
+    }
+
+    while (this.dispatches.size >= this.dispatchLedgerCapacity) {
+      const oldestTerminal = [...this.dispatches].find(([, entry]) => entry.state === "terminal");
+      if (!oldestTerminal) return { kind: "capacity-exhausted" };
+      this.dispatches.delete(oldestTerminal[0]);
+    }
+    const now = Date.now();
+    this.dispatches.set(correlationId, {
+      correlationId,
+      requestSignature,
+      state: "active",
+      createdAt: now,
+      updatedAt: now,
+    });
+    return { kind: "accepted" };
+  }
+
+  /** Attach generated A2A identity to an already claimed outer dispatch. */
+  bindDispatch(correlationId: string, taskId: string, contextId: string): void {
+    const entry = this.dispatches.get(correlationId);
+    if (!entry) throw new Error(`dispatch ${correlationId} was not claimed`);
+    if (entry.state === "terminal") throw new Error(`dispatch ${correlationId} is already terminal`);
+    if (entry.taskId && entry.taskId !== taskId) throw new Error(`dispatch ${correlationId} is already bound to task ${entry.taskId}`);
+    if (entry.contextId && entry.contextId !== contextId) throw new Error(`dispatch ${correlationId} is already bound to context ${entry.contextId}`);
+    entry.taskId = taskId;
+    entry.contextId = contextId;
+    entry.updatedAt = Date.now();
+  }
+
+  /**
+   * Persist the exact terminal wire return before attempting SignalR delivery.
+   * A later exact duplicate therefore retries the same task/context/session,
+   * body, message ID, outer envelope ID, and timestamp.
+   */
+  completeDispatch(correlationId: string, terminalEnvelope: ClusterLinkPayloadEnvelope): void {
+    const entry = this.dispatches.get(correlationId);
+    if (!entry) throw new Error(`dispatch ${correlationId} was not claimed`);
+    if (terminalEnvelope.correlationId !== correlationId) {
+      throw new Error(`terminal dispatch correlation ${terminalEnvelope.correlationId ?? "(missing)"} does not match ${correlationId}`);
+    }
+    if (entry.state === "terminal") {
+      if (JSON.stringify(entry.terminalEnvelope) !== JSON.stringify(terminalEnvelope)) {
+        throw new Error(`dispatch ${correlationId} already has a different terminal envelope`);
+      }
+      return;
+    }
+    entry.state = "terminal";
+    entry.terminalEnvelope = structuredClone(terminalEnvelope);
+    entry.updatedAt = Date.now();
+  }
+
   /** Create a task record in the initial `submitted` state. */
-  begin(taskId: string, contextId: string, source: TaskSource): TaskRecord {
+  begin(taskId: string, contextId: string, source: TaskSource, correlationId: string): TaskRecord {
     if (this.tasks.has(taskId)) throw new Error(`task ${taskId} already exists`);
     const now = Date.now();
-    const record: TaskRecord = { taskId, contextId, source, state: "submitted", createdAt: now, updatedAt: now, seq: 0 };
+    const record: TaskRecord = { taskId, correlationId, contextId, source, state: "submitted", createdAt: now, updatedAt: now, seq: 0 };
     this.tasks.set(taskId, record);
     this.contexts.set(taskId, contextId);
     while (this.contexts.size > this.contextMemoryCapacity) {
@@ -170,7 +271,7 @@ export class TaskRegistry {
     this.history.unshift({
       taskId,
       contextId: record?.contextId ?? this.knownContextOf(taskId) ?? "",
-      source: record?.source ?? "taskDispatched",
+      source: record?.source ?? "payload",
       state,
       startedAt: record?.createdAt ?? Date.now(),
       finishedAt: Date.now(),

@@ -1,10 +1,10 @@
 /**
  * Ordered relay queue: batching window + offline retention in one bounded
  * queue. The relay pushes {taskId, event} here; a timer (or the
- * post-registration hook) drains it into `reportTaskEvent` batches grouped by
- * task. Items whose send fails stay at the head until the hub is ready again.
+ * post-registration hook) drains it locally. A2A task state is reported by
+ * TaskIntake through the v2 DSH payload channel; relay diagnostics stay local.
  */
-import { type RelayEvent } from "../protocol.js";
+import type { RelayEvent } from "../protocol.js";
 import type { HubConnectionManager } from "../connection/hub-connection.js";
 import type { Logger } from "../services/log-buffer.js";
 export interface QueuedEvent {
@@ -22,9 +22,8 @@ export declare class EventBuffer {
     get size(): number;
     get droppedCount(): number;
     /**
-     * Send everything the hub accepts, one `reportTaskEvent` (kind=progress)
-     * per task. Returns the number of tasks flushed; failed tasks keep their
-     * events queued for the next drain.
+     * Relay diagnostics are not an A2A task-status schema, so they are never
+     * sent through ClusterLink v2. Draining clears the local queue.
      */
     drain(hub: HubConnectionManager, log: Logger): Promise<number>;
     clear(): void;

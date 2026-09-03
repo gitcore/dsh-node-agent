@@ -7,7 +7,7 @@
  * caught and logged — the plugin must never throw into the Host.
  */
 import type { Context } from "@deepseek-ai/cordis";
-import { loadConfig, type ClusterA2AMessageEnvelope, type ClusterTaskDispatch, type ClusterTaskEvent } from "./protocol.js";
+import { loadConfig, type ClusterLinkPayloadEnvelope } from "./protocol.js";
 import { LogBuffer, createLogger } from "./services/log-buffer.js";
 import { errorMessage, HubConnectionManager, type HubCallbacks } from "./connection/hub-connection.js";
 import { ReconnectPolicy } from "./connection/reconnect-policy.js";
@@ -20,7 +20,7 @@ import { ClusterService } from "./services/cluster-service.js";
 
 export const name = "dsh-node-agent";
 
-/** Required host services; agentDefaultModel is optional (resolved via ctx.get). */
+/** Required host services; agentDefaultModel and workspaceRegistry are optional (resolved via ctx.get). */
 export const inject = ["agents", "sessions"];
 
 export function apply(ctx: Context): void {
@@ -44,18 +44,11 @@ export function apply(ctx: Context): void {
       log.info("connection", "registered; draining buffered events");
       void eventBuffer.drain(hub, log);
     },
-    onTaskDispatched: (payload: ClusterTaskDispatch) => intake.onTaskDispatched(payload),
-    onA2AMessage: (message: ClusterA2AMessageEnvelope) => intake.onA2AMessage(message),
-    onTaskEventReceived: (event: ClusterTaskEvent) => {
-      // Hub-wide broadcast: only events for tasks this node owns matter.
-      if (registry.has(event.taskId)) {
-        log.info("events", `echo ${event.taskId} kind=${event.kind}`, event.taskId);
-      }
-    },
+    onPayloadDispatched: (payload: ClusterLinkPayloadEnvelope) => intake.onPayloadDispatched(payload),
   };
 
   const hub = new HubConnectionManager(config, callbacks, log, new ReconnectPolicy());
-  const relay = new EventRelay(ctx, contexts, registry, eventBuffer, log);
+  const relay = new EventRelay(ctx, contexts, (runtimeAgentId) => intake?.contextIdForRuntimeAgent(runtimeAgentId), registry, eventBuffer, log);
   intake = new TaskIntake(ctx, config, registry, contexts, hub, relay, log, counters);
 
   // Batching window: drain the relay queue on a fixed cadence; also the

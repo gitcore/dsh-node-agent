@@ -6,20 +6,10 @@
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
 
-/** Task-event kinds the node reports via `reportTaskEvent` (caller convention). */
-export const TASK_EVENT_KINDS = {
-  STARTED: "started",
-  PROGRESS: "progress",
-  COMPLETED: "completed",
-  FAILED: "failed",
-} as const;
-export type TaskEventKind = (typeof TASK_EVENT_KINDS)[keyof typeof TASK_EVENT_KINDS];
-
 /** Why a task reached a terminal state. */
 export type FinishReason = "completed" | "error" | "blocked" | "aborted";
 
 export interface LinkInfo {
-  protocol: "dsh" | "index";
   displayName?: string | null;
   version?: string | null;
   content?: string | null;
@@ -27,11 +17,13 @@ export interface LinkInfo {
 
 export interface ClusterNodeRegistration {
   nodeId: string;
+  nodeType: "dsh";
   link: LinkInfo;
 }
 
 export interface ClusterNodeSnapshot {
   nodeId: string;
+  nodeType: string;
   link: LinkInfo;
   connectionId: string | null;
   registeredAtUtc: string;
@@ -40,40 +32,22 @@ export interface ClusterNodeSnapshot {
   key: string | null;
 }
 
-export interface ClusterTaskDispatch {
-  taskId: string;
-  /** A2A conversation context; interpreted by the node, echoed in task events. */
-  contextId?: string | null;
-  prompt: string;
-  metadata?: Record<string, unknown> | null;
-}
-
-export interface ClusterTaskEvent {
-  taskId: string;
-  /** A2A conversation context; echoed from the dispatch once known. */
-  contextId?: string | null;
-  kind: string;
-  message?: string | null;
-  data?: Record<string, unknown> | null;
-  timestampUtc?: string;
-}
-
 /** Official A2A v1 `Message` model (from `@a2a-js/sdk`, wire-compatible with the hub's .NET A2A model). */
 export type A2AMessage = import("@a2a-js/sdk").Message;
 
-export interface ClusterA2AMessage {
-  toNodeId: string;
-  correlationId?: string | null;
-  message: A2AMessage;
+export interface DshA2APayload {
+  workspace?: string;
+  /** Reserved DSH payload field. Never used as A2A/Chat context or runtime recovery state. */
+  sessionId?: string;
+  a2a: Record<string, unknown>;
 }
 
-export interface ClusterA2AMessageEnvelope {
-  /** ClusterLink delivery id for dedupe/audit — NOT the A2A messageId. */
-  messageId: string;
-  fromNodeId: string;
+export interface ClusterLinkPayloadEnvelope {
+  id: string;
   toNodeId: string;
-  correlationId: string | null;
-  message: A2AMessage;
+  correlationId?: string | null;
+  payloadType: string;
+  payload: DshA2APayload;
   timestampUtc: string;
 }
 
